@@ -33,6 +33,9 @@ class PipelineReport:
     profiled_companies: int = 0
     profile_observations: int = 0
     profile_run_id: str = ""
+    devtools_companies: int = 0
+    devtools_observations: int = 0
+    devtools_run_id: str = ""
     skipped: str = ""
     errors: list[str] = field(default_factory=list)
 
@@ -42,6 +45,9 @@ class PipelineReport:
             "profiled_companies": self.profiled_companies,
             "profile_observations": self.profile_observations,
             "profile_run_id": self.profile_run_id,
+            "devtools_companies": self.devtools_companies,
+            "devtools_observations": self.devtools_observations,
+            "devtools_run_id": self.devtools_run_id,
             "skipped": self.skipped,
             "errors": self.errors,
         }
@@ -89,6 +95,7 @@ async def run_prospecting(
     profile_limit: int = 200,
     devtools: bool = False,
     devtools_limit: int = 50,
+    devtools_evidence: dict | None = None,
     dry_run: bool = False,
 ) -> PipelineReport:
     """Discover businesses, then read what their websites say about them.
@@ -127,10 +134,23 @@ async def run_prospecting(
         logger.exception("profile stage failed")
         report.errors.append(f"profile: {e}")
 
-    # Optional DevTools enrichment stage (default: False, minimal hook)
+    # Optional DevTools enrichment stage (default: False, offline pipeline adapter)
     if devtools:
         try:
-            logger.info("devtools: running optional devtools evaluation hook (limit=%d)", devtools_limit)
+            from harvey.collectors.devtools import DevToolsPipelineAdapter
+            adapter = DevToolsPipelineAdapter(state, evidence_bundle=devtools_evidence)
+            devtools_res = await adapter.run(limit=devtools_limit)
+            report.devtools_companies = devtools_res.evaluated_companies
+            report.devtools_observations = devtools_res.recorded_observations
+            report.devtools_run_id = devtools_res.run_id
+            if devtools_res.errors:
+                report.errors.extend(devtools_res.errors)
+            logger.info(
+                "devtools: evaluated %d companies, recorded %d observations (run_id=%s)",
+                devtools_res.evaluated_companies,
+                devtools_res.recorded_observations,
+                devtools_res.run_id,
+            )
         except Exception as e:
             logger.exception("devtools stage failed")
             report.errors.append(f"devtools: {e}")

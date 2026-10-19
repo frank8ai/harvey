@@ -1,4 +1,5 @@
 import json
+import os
 import pytest
 from pathlib import Path
 
@@ -12,6 +13,9 @@ from harvey.collectors.devtools import (
     detect_competitor_or_disqualification,
     evaluate_devtools_prospect,
     record_devtools_observations,
+    build_opportunity_card,
+    export_opportunity_cards,
+    DevToolsPipelineAdapter,
 )
 from harvey.signals import seed_signal_catalog
 from harvey.state import StateManager
@@ -25,22 +29,28 @@ def offline_fixtures():
         return json.load(f)
 
 
-# ── Requirement 4: Positive samples extract concrete evidence ─────────
-def test_positive_saas_otp_and_playwright(offline_fixtures):
+# ── Requirement 1 & P0-B: Strong technical match is POTENTIAL_FIT, NOT CONFIRMED_ACTIVE_BUYER ──
+def test_strong_tech_match_evaluates_to_potential_fit(offline_fixtures):
     sample = offline_fixtures["saas_with_otp"]
     res = evaluate_devtools_prospect(
         domain=sample["domain"],
         company_name=sample["company_name"],
         html_login=sample["html_login"],
+        url_login=sample["url_login"],
         html_careers=sample["html_careers"],
+        url_careers=sample["url_careers"],
         html_docs=sample["html_docs"],
+        url_docs=sample["url_docs"],
         dns_spf=sample["dns_spf"],
+        dns_source=sample["dns_source"],
     )
     assert res.icp_fit == "TIER_1_STRONG_FIT"
     assert res.use_case_fit == "E2E_AUTH_TESTING"
     assert res.evidence_quality == "SUFFICIENT"
-    assert len(res.purchase_intent_evidence) > 0
-    assert res.qualification_status == "CONFIRMED_ACTIVE_BUYER"
+    # Strict correction: Active hiring does NOT grant CONFIRMED_ACTIVE_BUYER
+    assert res.qualification_status == "POTENTIAL_FIT"
+    assert res.qualification_status != "CONFIRMED_ACTIVE_BUYER"
+    assert res.next_best_research_action != "READY_FOR_OUTREACH"
     assert not res.disqualified
 
 
@@ -50,26 +60,57 @@ def test_positive_ai_browser_agent(offline_fixtures):
         domain=sample["domain"],
         company_name=sample["company_name"],
         html_login=sample["html_login"],
+        url_login=sample["url_login"],
         html_careers=sample["html_careers"],
+        url_careers=sample["url_careers"],
         html_docs=sample["html_docs"],
+        url_docs=sample["url_docs"],
         dns_spf=sample["dns_spf"],
+        dns_source=sample["dns_source"],
     )
     assert res.icp_fit == "TIER_1_STRONG_FIT"
     assert res.use_case_fit == "AGENT_INBOX"
     assert res.evidence_quality == "SUFFICIENT"
-    assert res.qualification_status == "CONFIRMED_ACTIVE_BUYER"
+    # Strict correction: Technical agent capabilities alone do not equal active buyer
+    assert res.qualification_status == "POTENTIAL_FIT"
+    assert res.qualification_status != "CONFIRMED_ACTIVE_BUYER"
     assert not res.disqualified
 
 
-# ── Requirement 5: Negative samples NOT misclassified as buyers ───────
+# ── Requirement 2: Explicit procurement documentation forms human verification candidate ──
+def test_explicit_procurement_documentation_requires_human_verification(offline_fixtures):
+    sample = offline_fixtures["procurement_candidate"]
+    res = evaluate_devtools_prospect(
+        domain=sample["domain"],
+        company_name=sample["company_name"],
+        html_login=sample["html_login"],
+        url_login=sample["url_login"],
+        html_careers=sample["html_careers"],
+        url_careers=sample["url_careers"],
+        html_docs=sample["html_docs"],
+        url_docs=sample["url_docs"],
+        dns_spf=sample["dns_spf"],
+        dns_source=sample["dns_source"],
+        purchase_evidence=sample["purchase_evidence"],
+    )
+    assert res.qualification_status == "PURCHASE_CANDIDATE_PENDING_VERIFICATION"
+    assert res.qualification_status != "CONFIRMED_ACTIVE_BUYER"
+    assert res.next_best_research_action == "HUMAN_PROCUREMENT_VERIFICATION"
+    assert len(res.purchase_intent_evidence) == 1
+
+
+# ── Requirement 3: Negative samples NOT misclassified as buyers ───────
 def test_competitor_disqualified(offline_fixtures):
     sample = offline_fixtures["direct_competitor"]
     res = evaluate_devtools_prospect(
         domain=sample["domain"],
         company_name=sample["company_name"],
         html_login=sample["html_login"],
+        url_login=sample["url_login"],
         html_careers=sample["html_careers"],
+        url_careers=sample["url_careers"],
         html_docs=sample["html_docs"],
+        url_docs=sample["url_docs"],
         dns_spf=sample["dns_spf"],
     )
     assert res.disqualified is True
@@ -84,8 +125,11 @@ def test_consumer_retail_disqualified(offline_fixtures):
         domain=sample["domain"],
         company_name=sample["company_name"],
         html_login=sample["html_login"],
+        url_login=sample["url_login"],
         html_careers=sample["html_careers"],
+        url_careers=sample["url_careers"],
         html_docs=sample["html_docs"],
+        url_docs=sample["url_docs"],
         dns_spf=sample["dns_spf"],
     )
     assert res.disqualified is True
@@ -93,8 +137,8 @@ def test_consumer_retail_disqualified(offline_fixtures):
     assert res.qualification_status == "DISQUALIFIED"
 
 
-# ── Requirement 6: Empty text cannot become high ICP ──────────────────
-def test_empty_text_cannot_become_high_icp():
+# ── Requirement 4: Empty input must evaluate to UNKNOWN, never NO_AUTOMATION_NEED ──
+def test_empty_input_evaluates_to_unknown_never_no_automation_need():
     res = evaluate_devtools_prospect(
         domain="blank-placeholder.org",
         company_name="Blank Co",
@@ -103,47 +147,51 @@ def test_empty_text_cannot_become_high_icp():
         html_docs="",
         dns_spf=[],
     )
-    assert res.icp_fit == "NON_ICP"
+    assert res.icp_fit == "UNKNOWN"
+    assert res.use_case_fit == "UNKNOWN"
+    assert res.qualification_status == "UNKNOWN"
     assert res.evidence_quality == "INSUFFICIENT"
-    assert res.qualification_status == "DISQUALIFIED"
-    assert res.disqualified is True
+    assert res.disqualified is False
+    assert res.disqualified_reason is None
+    assert "html_login" in res.unknown_fields
 
 
-# ── Requirement 7: Stale / archived job is not active buyer signal ────
-def test_stale_job_not_treated_as_active_intent(offline_fixtures):
-    sample = offline_fixtures["stale_hiring_saas"]
+# ── Requirement 5: Source URL tracking (No fabricated URL) ─────────────
+def test_source_url_integrity_marks_unknown_when_not_provided():
     res = evaluate_devtools_prospect(
-        domain=sample["domain"],
-        company_name=sample["company_name"],
-        html_login=sample["html_login"],
-        html_careers=sample["html_careers"],
-        html_docs=sample["html_docs"],
-        dns_spf=sample["dns_spf"],
+        domain="unvisited.dev",
+        company_name="Unvisited Co",
+        html_login="<form><p>Enter your 6-digit verification code</p></form>",
+        url_login="",  # Empty source URL
+        html_careers="<p>Hiring Playwright SDET</p>",
+        url_careers="",  # Empty source URL
     )
-    # Stale hiring means NO active purchase intent items
-    assert len(res.purchase_intent_evidence) == 0
-    # Must NOT be marked CONFIRMED_ACTIVE_BUYER
-    assert res.qualification_status != "CONFIRMED_ACTIVE_BUYER"
-    assert res.qualification_status == "POTENTIAL_FIT"
+    for sig in res.extracted_signals:
+        # Must NOT invent https://unvisited.dev/login when not verified
+        assert sig["source_url"] == "UNKNOWN"
 
 
-# ── Requirement 8: Single page repeated mentions is not 2 sources ─────
+# ── Requirement 6: Single page or duplicated content does not inflate sources ──
 def test_single_page_duplication_counts_as_one_source(offline_fixtures):
     sample = offline_fixtures["single_page_duplication"]
     res = evaluate_devtools_prospect(
         domain=sample["domain"],
         company_name=sample["company_name"],
         html_login=sample["html_login"],
+        url_login=sample["url_login"],
         html_careers=sample["html_careers"],
+        url_careers=sample["url_careers"],
         html_docs=sample["html_docs"],
+        url_docs=sample["url_docs"],
         dns_spf=sample["dns_spf"],
     )
-    # Only 1 source URL (login), so evidence quality is PARTIAL, never SUFFICIENT
+    # Only 1 unique content source, so evidence quality is PARTIAL, never SUFFICIENT
     assert res.evidence_quality == "PARTIAL"
+    assert res.qualification_status == "POTENTIAL_FIT"
     assert res.qualification_status != "CONFIRMED_ACTIVE_BUYER"
 
 
-# ── Requirement 9: DNS SPF alone does not produce buying conclusion ──
+# ── Requirement 7: DNS SPF alone is technical lead, not sufficient ───
 def test_dns_spf_alone_is_technical_lead_only():
     res = evaluate_devtools_prospect(
         domain="silent-dns-only.com",
@@ -152,13 +200,48 @@ def test_dns_spf_alone_is_technical_lead_only():
         html_careers="",
         html_docs="",
         dns_spf=["v=spf1 include:sendgrid.net include:postmarkapp.com ~all"],
+        dns_source="dns:spf:silent-dns-only.com",
     )
     assert res.evidence_quality == "INSUFFICIENT"
     assert len(res.purchase_intent_evidence) == 0
+    assert res.qualification_status == "NEEDS_RESEARCH"
     assert res.qualification_status != "CONFIRMED_ACTIVE_BUYER"
 
 
-# ── Requirement 10: Cohort query matching on technical signals ───────
+# ── Requirement 8: OpportunityCard generation and JSON export ─────────
+def test_opportunity_card_generation_and_export(offline_fixtures, tmp_path):
+    sample = offline_fixtures["saas_with_otp"]
+    res = evaluate_devtools_prospect(
+        domain=sample["domain"],
+        company_name=sample["company_name"],
+        html_login=sample["html_login"],
+        url_login=sample["url_login"],
+        html_careers=sample["html_careers"],
+        url_careers=sample["url_careers"],
+        html_docs=sample["html_docs"],
+        url_docs=sample["url_docs"],
+        dns_spf=sample["dns_spf"],
+        dns_source=sample["dns_source"],
+    )
+    card = build_opportunity_card(
+        {"id": "c_authagent_1", "name": sample["company_name"], "domain": sample["domain"]},
+        res,
+    )
+    assert card.company_id == "c_authagent_1"
+    assert card.icp_fit == "TIER_1_STRONG_FIT"
+    assert card.qualification_status == "POTENTIAL_FIT"
+    assert "HAS_SIGNUP_OTP_OR_MAGIC_LINK" in card.signals
+
+    out_file = str(tmp_path / "opportunity_cards.json")
+    count, text = export_opportunity_cards([card], out_path=out_file)
+    assert count == 1
+    assert os.path.exists(out_file)
+    loaded = json.loads(text)
+    assert loaded[0]["domain"] == sample["domain"]
+    assert loaded[0]["qualification_status"] == "POTENTIAL_FIT"
+
+
+# ── Requirement 9: Cohort filtering on DevTools signals in SQLite ─────
 @pytest.mark.asyncio
 async def test_cohort_filtering_by_devtools_signals(tmp_path):
     db_file = tmp_path / "cohort_harvey.db"
@@ -205,67 +288,67 @@ async def test_cohort_filtering_by_devtools_signals(tmp_path):
     assert comp_a not in cohort_disq
 
 
-# ── Requirement 11: Observation timestamps and conflict handling ──────
+# ── Requirement 10: Full DevToolsPipelineAdapter offline execution ─────
 @pytest.mark.asyncio
-async def test_observation_timestamp_and_deterministic_conflict(tmp_path):
-    db_file = tmp_path / "conflict_harvey.db"
+async def test_devtools_pipeline_adapter_offline_run(offline_fixtures, tmp_path):
+    db_file = tmp_path / "adapter_test.db"
     state = StateManager(str(db_file))
     await state.init_db()
     await seed_signal_catalog(state)
-    await state.set_signal_status("VERISIG_EVIDENCE_SUFFICIENCY", "confirmed")
 
-    comp_id = await state.add_company(Company(name="ConflictTest", domain="conflict.com"))
+    for code in [
+        "HAS_SIGNUP_OTP_OR_MAGIC_LINK",
+        "USES_E2E_TEST_FRAMEWORK",
+        "BUILDS_AI_OR_BROWSER_AGENTS",
+        "HAS_DEVELOPER_DOCS_OR_API",
+        "USES_TRANSACTIONAL_EMAIL_ESP",
+        "HIRING_QA_OR_AGENT_INFRA",
+        "VERISIG_EVIDENCE_SUFFICIENCY",
+        "VERISIG_DISQUALIFIED_REASON",
+    ]:
+        await state.set_signal_status(code, "confirmed")
 
-    # T1: Observed PARTIAL
-    await state.add_observations([
-        {
-            "company_id": comp_id,
-            "signal_code": "VERISIG_EVIDENCE_SUFFICIENCY",
-            "collector": "qualification",
-            "value_text": "PARTIAL",
-            "confidence": 0.7,
-        }
-    ])
+    # Inject bundle with 2 samples
+    bundle = {
+        "authagent.io": offline_fixtures["saas_with_otp"],
+        "direct_comp.io": offline_fixtures["direct_competitor"],
+    }
 
-    # T2: Later Observed SUFFICIENT
-    await state.add_observations([
-        {
-            "company_id": comp_id,
-            "signal_code": "VERISIG_EVIDENCE_SUFFICIENCY",
-            "collector": "qualification",
-            "value_text": "SUFFICIENT",
-            "confidence": 0.95,
-        }
-    ])
+    adapter = DevToolsPipelineAdapter(state, evidence_bundle=bundle)
+    res = await adapter.run(limit=10)
 
-    # Fetch company observations
-    obs = await state.get_observations(company_id=comp_id)
-    sufficiency_obs = [o for o in obs if o["signal_code"] == "VERISIG_EVIDENCE_SUFFICIENCY"]
-    assert len(sufficiency_obs) == 2
+    assert res.evaluated_companies == 2
+    assert res.recorded_observations >= 4
+    assert len(res.opportunity_cards) == 2
+    assert len(res.errors) == 0
 
-    # Deterministic rule: highest confidence / latest observation wins
-    latest_winning = max(sufficiency_obs, key=lambda x: (x["confidence"], x["observed_at"]))
-    assert latest_winning["value_text"] == "SUFFICIENT"
+    # Verify observations written into SQLite
+    all_obs = await state.get_observations()
+    assert len(all_obs) >= 4
+    signal_codes_recorded = {o["signal_code"] for o in all_obs}
+    assert "VERISIG_EVIDENCE_SUFFICIENCY" in signal_codes_recorded
 
 
-# ── Requirement 12: Zero network access verification ──────────────────
+# ── Requirement 11: Zero network access guarantee ─────────────────────
 def test_zero_network_access_guarantee(monkeypatch):
-    # If any HTTP client is invoked, fail immediately
     def forbidden_network(*args, **kwargs):
-        raise RuntimeError("Network call attempted during offline test!")
+        raise RuntimeError("Forbidden outbound network call during offline test!")
 
     import httpx
     monkeypatch.setattr(httpx.AsyncClient, "request", forbidden_network)
     monkeypatch.setattr(httpx.Client, "request", forbidden_network)
 
-    # Pure extraction must run completely offline without triggering forbidden_network
     res = evaluate_devtools_prospect(
         domain="offline-guarantee.dev",
         company_name="Offline Test Co",
         html_login="<form><p>Enter your 6-digit verification code</p></form>",
+        url_login="https://offline-guarantee.dev/login",
         html_careers="<p>Hiring Senior QA Engineer (Playwright)</p>",
+        url_careers="https://offline-guarantee.dev/careers",
         html_docs="<h1>Developer API Reference</h1>",
+        url_docs="https://offline-guarantee.dev/docs",
         dns_spf=["v=spf1 include:postmarkapp.com ~all"],
+        dns_source="dns:spf:offline-guarantee.dev",
     )
     assert res.evidence_quality == "SUFFICIENT"
-    assert res.qualification_status == "CONFIRMED_ACTIVE_BUYER"
+    assert res.qualification_status == "POTENTIAL_FIT"
