@@ -1,3 +1,4 @@
+import secrets
 """Mail provider abstraction — Harvey owns its sending, Instantly optional.
 
 A MailProvider gives Harvey full inbox control: send, read replies,
@@ -18,10 +19,18 @@ it isn't a MailProvider because Instantly owns sequencing/sending itself.
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from enum import Enum
 
 logger = logging.getLogger("harvey.mail")
 
-NATIVE_PROVIDERS = ("gmail", "smtp", "microsoft")
+NATIVE_PROVIDERS = ("gmail", "smtp", "microsoft", "dry_run")
+
+
+class ExecutionStatus(str, Enum):
+    """Explicit status contract separating external execution from internal simulation."""
+    BLOCKED = "blocked"
+    SIMULATED = "simulated"
+    SENT_CONFIRMED = "sent_confirmed"
 
 
 @dataclass
@@ -30,6 +39,7 @@ class SendResult:
     message_id: str = ""     # RFC Message-ID (or provider id) of the sent mail
     thread_ref: str = ""     # provider thread handle (Gmail threadId, etc.)
     error: str = ""
+    execution_status: ExecutionStatus = ExecutionStatus.SENT_CONFIRMED
 
 
 @dataclass
@@ -89,9 +99,66 @@ class MailProvider(ABC):
         """Cheap end-to-end credential check. Returns (ok, detail)."""
 
 
+class DryRunMailProvider(MailProvider):
+    """Physical-lock mock provider for FetchInbox self-use / sandbox experiments.
+    Never initiates network sockets, HTTP requests, or SMTP connections.
+    Records all simulated outbound sends in memory for safety verification.
+    """
+
+    name: str = "dry_run"
+
+    def __init__(self, config=None, env=None):
+        self.config = config
+        self.env = env
+        self.sent_messages: list[dict] = []
+        self.inbound_messages: list[InboundMessage] = []
+
+    def is_configured(self) -> bool:
+        return True
+
+    async def send_email(
+        self,
+        to_email: str,
+        subject: str,
+        body: str,
+        thread_ref: str = "",
+        in_reply_to: str = "",
+    ) -> SendResult:
+        idx = len(self.sent_messages) + 1
+        msg_id = f"<dryrun-{idx}-{secrets.token_hex(4)}@local.test>"
+        t_ref = thread_ref or f"dryrun-thread-{idx}"
+        self.sent_messages.append({
+            "to": to_email,
+            "subject": subject,
+            "body": body,
+            "thread_ref": t_ref,
+            "in_reply_to": in_reply_to,
+            "message_id": msg_id,
+        })
+        logger.info(
+            "DryRunMailProvider: [PHYSICALLY BLOCKED OUTBOUND] Captured email to %s (subject: %s)",
+            to_email,
+            subject[:40],
+        )
+        return SendResult(
+            ok=False,
+            message_id=msg_id,
+            thread_ref=t_ref,
+            execution_status=ExecutionStatus.SIMULATED,
+        )
+
+    async def get_replies(self, limit: int = 50) -> list[InboundMessage]:
+        return self.inbound_messages[:limit]
+
+    async def test_connection(self) -> tuple[bool, str]:
+        return True, "DryRun active: Zero live outreach (Physical send lock engaged)"
+
+
 def get_mail_provider(config, env) -> MailProvider | None:
     """Build the configured native provider, or None for instantly/unknown."""
     provider = (config.channels.email.provider or "").strip().lower()
+    if provider == "dry_run":
+        return DryRunMailProvider(config, env)
     if provider == "gmail":
         from harvey.integrations.gmail import GmailProvider
         return GmailProvider(config, env)

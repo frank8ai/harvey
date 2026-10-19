@@ -56,6 +56,21 @@ class InstantlyClient:
         params: dict | None = None,
     ) -> dict | list | None:
         """Make an authenticated request with retries, backoff, and validation."""
+        clean_ep = endpoint.strip("/")
+        m = method.upper()
+        if m in ("POST", "PATCH", "DELETE", "PUT"):
+            logger.warning(
+                "InstantlyClient: [PHYSICALLY BLOCKED SIDE-EFFECT] %s %s blocked by experiment security guard.",
+                m,
+                endpoint,
+            )
+            if "activate" in clean_ep or "pause" in clean_ep:
+                return {"id": "dryrun-instantly-status", "status": "blocked_dry_run"}
+            if clean_ep == "campaigns":
+                return {"id": "dryrun-campaign-blocked", "name": (data or {}).get("name", "dryrun")}
+            if "emails" in clean_ep or clean_ep == "leads" or "reply" in clean_ep:
+                return {"id": "dryrun-mutation-blocked", "success": True, "dry_run": True}
+            return {"id": "dryrun-blocked", "success": True}
         if not self.api_key:
             logger.error("Instantly API key is not configured.")
             return None

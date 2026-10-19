@@ -236,10 +236,12 @@ class Scout:
         block detection, or any transport error. Never raises.
         """
         last_status = None
+        from harvey.security_ssrf import SSRFSafeTransport
+        transport = SSRFSafeTransport()
         for attempt in range(retries):
             try:
                 async with httpx.AsyncClient(
-                    timeout=timeout, follow_redirects=True
+                    timeout=timeout, transport=transport, follow_redirects=True
                 ) as client:
                     resp = await client.request(
                         method,

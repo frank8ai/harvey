@@ -224,6 +224,17 @@ class MicrosoftProvider(MailProvider):
         """Draft, then send, so the RFC Message-ID is known (bounces and
         replies are matched on it). A reply is drafted with createReply on
         the prospect's message, which sets In-Reply-To/References."""
+        # Physical send lock for FetchInbox self-use experiment
+        if self._transport is None:
+            logger.warning(
+                "MicrosoftProvider: [PHYSICALLY BLOCKED OUTBOUND] Attempted live Graph send to %s (subject: %s) blocked.",
+                to_email,
+                subject[:40],
+            )
+            return SendResult(
+                ok=False,
+                error="PHYSICALLY BLOCKED: Microsoft 365 live sending is physically disabled in this environment.",
+            )
         content = {
             "subject": subject,
             "body": {"contentType": "Text", "content": body},

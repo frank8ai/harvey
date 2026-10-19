@@ -182,7 +182,9 @@ class ProfileCollector:
         return code in self.confirmed
 
     async def __aenter__(self):
+        from harvey.security_ssrf import SSRFSafeTransport
         self._client = httpx.AsyncClient(
+            transport=SSRFSafeTransport(),
             timeout=TIMEOUT, follow_redirects=True,
             headers={"User-Agent": random.choice(USER_AGENTS),
                      "Accept": "text/html,application/xhtml+xml,*/*;q=0.8"},

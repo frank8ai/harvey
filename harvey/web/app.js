@@ -79,6 +79,7 @@ const STATUS = {
   failed:         ['Failed', 'bad'],
   rejected:       ['Rejected', 'idle'],
   cancelled:      ['Cancelled', 'idle'],
+  simulated:      ['Simulated (Dry-Run)', 'idle'],
   // signals
   proposed:       ['Waiting on you', 'waiting'],
   confirmed:      ['Confirmed', 'good'],
@@ -1099,6 +1100,10 @@ async function loadOutbox() {
     table('Didn\'t send', data.failed, [
       ['To', r => r.to_email], ['Status', r => badge(r.status), false, true],
       ['Reason', r => r.error, true], ['Updated', r => formatDate(r.updated_at), true],
+    ]) +
+    table('Simulated (Dry-Run)', data.simulated, [
+      ['To', r => r.to_email], ['Status', r => badge(r.status), false, true],
+      ['Detail', r => r.error || 'Simulated', true], ['Updated', r => formatDate(r.updated_at), true],
     ]);
 }
 

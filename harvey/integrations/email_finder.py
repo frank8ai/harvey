@@ -424,6 +424,11 @@ async def verify_hunter(email: str, api_key: str) -> Optional[dict]:
 
 
 async def verify_email_smtp(email: str) -> Optional[bool]:
+    # Physical send / probe lock for FetchInbox self-use experiment
+    logger.info("verify_email_smtp: [PHYSICALLY BLOCKED OUTBOUND] Skipped live SMTP probe for %s", email)
+    return None
+
+async def _legacy_verify_email_smtp(email: str) -> Optional[bool]:
     """SMTP RCPT check — only trustworthy for small, self-hosted mail servers.
 
     Returns True (accepted), False (rejected), or None (couldn't tell).
