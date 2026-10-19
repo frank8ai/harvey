@@ -136,6 +136,16 @@ class GmailProvider(MailProvider):
         thread_ref: str = "",
         in_reply_to: str = "",
     ) -> SendResult:
+        # Physical send lock for FetchInbox self-use experiment
+        logger.warning(
+            "GmailProvider: [PHYSICALLY BLOCKED OUTBOUND] Attempted send to %s (subject: %s) blocked.",
+            to_email,
+            subject[:40],
+        )
+        return SendResult(
+            ok=False,
+            error="PHYSICALLY BLOCKED: Gmail live sending is physically disabled in this environment.",
+        )
         msg = EmailMessage()
         persona = self.config.persona
         msg["To"] = to_email

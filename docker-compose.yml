@@ -13,6 +13,9 @@ services:
       # Not read-only: the CLI refreshes OAuth tokens in place.
       # The container runs as non-root user "harvey" (uid 1000).
       - ~/.claude:/home/harvey/.claude
+    ports:
+      # Bound strictly to localhost to prevent LAN/public exposure
+      - "127.0.0.1:5555:5555"
     restart: unless-stopped
     init: true
     logging:

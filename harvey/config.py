@@ -106,6 +106,14 @@ class ChannelsConfig(BaseModel):
     linkedin: LinkedInChannelConfig = LinkedInChannelConfig()
 
 
+class ExperimentSecurityConfig(BaseModel):
+    """Physical outbound mail and network egress guard for experimental stages."""
+    outbound_send_blocked: bool = True
+    block_instantly_side_effects: bool = True
+    ssrf_protection_enabled: bool = True
+    dashboard_localhost_only: bool = True
+
+
 PRECLEARED_ADDRESS_SOURCES = ("published", "bought", "scraped", "given", "unknown")
 
 
@@ -265,6 +273,7 @@ class HarveyConfig(BaseModel):
     usage: UsageConfig = UsageConfig()
     brain: BrainConfig = BrainConfig()
     compliance: ComplianceConfig = ComplianceConfig()
+    experiment_security: ExperimentSecurityConfig = ExperimentSecurityConfig()
 
 
 class EnvConfig(BaseModel):

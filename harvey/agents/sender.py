@@ -62,7 +62,20 @@ class Sender:
         self.state = state
         self.config = config
         self.instantly = InstantlyClient(env.instantly_api_key)
-        self.provider = get_mail_provider(config, env)
+        provider = get_mail_provider(config, env)
+        # Fail-closed physical send lock: unless provider is an explicit DryRun/Null provider,
+        # replace with DryRunMailProvider during experiment security mode.
+        from harvey.integrations.mail_provider import DryRunMailProvider
+        sec_cfg = getattr(config, "experiment_security", None)
+        outbound_blocked = getattr(sec_cfg, "outbound_send_blocked", True) if sec_cfg else True
+        if outbound_blocked:
+            if not isinstance(provider, DryRunMailProvider):
+                logger.info("Sender: [PHYSICAL SEND LOCK ENGAGED] Replaced provider %s with DryRunMailProvider", getattr(provider, "name", "none"))
+                self.provider = DryRunMailProvider(config, env)
+            else:
+                self.provider = provider
+        else:
+            self.provider = provider
         # Optional per-recipient compliance check; None unless enabled.
         self.precleared = PreclearedClient.from_config(config, env)
         # Disabled in tests to skip inter-send sleeps.
