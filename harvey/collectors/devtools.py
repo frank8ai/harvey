@@ -25,13 +25,17 @@ Design principles & W1-03-R Corrections:
 - Reuses Harvey models, state and observations interface.
 """
 
+import asyncio
 import hashlib
 import json
 import logging
 import re
+import socket
+import urllib.request
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 
 logger = logging.getLogger("harvey.collectors.devtools")
 
@@ -133,6 +137,108 @@ CONSUMER_PATTERNS = [
 
 
 # ── Helper: Normalized Content Fingerprint ────────────────────────────
+
+
+# ── Outbound Network Blocker & Audit Guard ───────────────────────────
+
+class OfflineNetworkBlockedError(RuntimeError):
+    """Raised when any outbound network request is attempted during offline execution."""
+
+
+class OutboundCallTracker:
+    """Tracks attempted outbound calls for strict offline assertion."""
+    def __init__(self):
+        self.call_count = 0
+        self.calls: list[tuple[str, str]] = []
+
+    def record(self, call_type: str, target: str):
+        self.call_count += 1
+        self.calls.append((call_type, str(target)))
+
+
+@contextmanager
+def offline_network_guard(tracker: Optional[OutboundCallTracker] = None):
+    """Strict outbound network guard for offline execution.
+    Blocks DNS lookups, raw socket connects, httpcore HTTP calls, urllib, and asyncio connections.
+    Localhost is permitted only for local IPC/database.
+    """
+    orig_gai = socket.getaddrinfo
+    orig_connect = socket.socket.connect
+    orig_create_conn = asyncio.BaseEventLoop.create_connection
+
+    try:
+        import httpcore
+        orig_httpcore_handle = getattr(httpcore.ConnectionPool, "handle_request", None)
+        orig_httpcore_async = getattr(httpcore.AsyncConnectionPool, "handle_async_request", None)
+    except ImportError:
+        orig_httpcore_handle = None
+        orig_httpcore_async = None
+
+    orig_urllib_open = getattr(urllib.request, "urlopen", None)
+
+    def block_dns(host, *args, **kwargs):
+        if host not in ("127.0.0.1", "localhost", "::1", None):
+            if tracker:
+                tracker.record("DNS", host)
+            raise OfflineNetworkBlockedError(f"Outbound DNS lookup blocked in offline mode: {host}")
+        return orig_gai(host, *args, **kwargs)
+
+    def block_connect(self, address):
+        host = address[0] if isinstance(address, tuple) and len(address) > 0 else str(address)
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            if tracker:
+                tracker.record("SOCKET", address)
+            raise OfflineNetworkBlockedError(f"Outbound socket connect blocked in offline mode: {address}")
+        return orig_connect(self, address)
+
+    def block_http(self_pool, request, *args, **kwargs):
+        target = str(getattr(request, "url", "unknown"))
+        if tracker:
+            tracker.record("HTTP_SYNC", target)
+        raise OfflineNetworkBlockedError(f"Outbound HTTP request blocked in offline mode: {target}")
+
+    async def block_http_async(self_pool, request, *args, **kwargs):
+        target = str(getattr(request, "url", "unknown"))
+        if tracker:
+            tracker.record("HTTP_ASYNC", target)
+        raise OfflineNetworkBlockedError(f"Outbound HTTP async request blocked in offline mode: {target}")
+
+    def block_urllib(url, *args, **kwargs):
+        target = url if isinstance(url, str) else getattr(url, "full_url", str(url))
+        if tracker:
+            tracker.record("URLLIB", target)
+        raise OfflineNetworkBlockedError(f"Outbound urllib request blocked in offline mode: {target}")
+
+    async def block_create_conn(self, protocol_factory, host=None, port=None, *args, **kwargs):
+        if host and host not in ("127.0.0.1", "localhost", "::1"):
+            if tracker:
+                tracker.record("ASYNCIO_CONN", f"{host}:{port}")
+            raise OfflineNetworkBlockedError(f"Outbound asyncio connection blocked in offline mode: {host}:{port}")
+        return await orig_create_conn(self, protocol_factory, host=host, port=port, *args, **kwargs)
+
+    socket.getaddrinfo = block_dns
+    socket.socket.connect = block_connect
+    if orig_httpcore_handle:
+        httpcore.ConnectionPool.handle_request = block_http
+    if orig_httpcore_async:
+        httpcore.AsyncConnectionPool.handle_async_request = block_http_async
+    if orig_urllib_open:
+        urllib.request.urlopen = block_urllib
+    asyncio.BaseEventLoop.create_connection = block_create_conn
+
+    try:
+        yield tracker
+    finally:
+        socket.getaddrinfo = orig_gai
+        socket.socket.connect = orig_connect
+        if orig_httpcore_handle:
+            httpcore.ConnectionPool.handle_request = orig_httpcore_handle
+        if orig_httpcore_async:
+            httpcore.AsyncConnectionPool.handle_async_request = orig_httpcore_async
+        if orig_urllib_open:
+            urllib.request.urlopen = orig_urllib_open
+        asyncio.BaseEventLoop.create_connection = orig_create_conn
+
 
 def _content_fingerprint(text: str) -> str:
     """Compute a lightweight hash of normalized whitespace text."""
@@ -311,6 +417,12 @@ class DevToolsQualificationResult:
     extracted_signals: list[dict] = field(default_factory=list)
     independent_source_count: int = 0
     confidence_model: str = "rule_confidence_uncalibrated"
+    source_breakdown: dict[str, list[str]] = field(default_factory=lambda: {
+        "verified_source": [],
+        "offline_fixture": [],
+        "unverified_source": [],
+    })
+    evidence_bundle_metadata: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -328,6 +440,8 @@ class DevToolsQualificationResult:
             "extracted_signals": self.extracted_signals,
             "independent_source_count": self.independent_source_count,
             "confidence_model": self.confidence_model,
+            "source_breakdown": self.source_breakdown,
+            "evidence_bundle_metadata": self.evidence_bundle_metadata,
         }
 
 
@@ -413,6 +527,8 @@ def evaluate_devtools_prospect(
     purchase_evidence: list[dict] | None = None,
     final_redirects: dict[str, str] | None = None,
     collected_at: str = "",
+    source_type: str = "",
+    collection_method: str = "",
     raw_observations: list[dict] | None = None,
 ) -> DevToolsQualificationResult:
     """Evaluate candidate evidence according to the corrected W1-03-R qualification contract."""
@@ -438,8 +554,20 @@ def evaluate_devtools_prospect(
             "TECH_STACK",
             "TEST_AUTOMATION_NEED",
         ]
+        result.evidence_bundle_metadata = {
+            "source_type": source_type or "UNKNOWN",
+            "collection_method": collection_method or "UNKNOWN",
+            "collected_at": collected_at or "UNKNOWN",
+        }
         result.next_best_research_action = "DISCOVER_COMPANY_PROFILE"
         return result
+
+    # Evidence bundle provenance metadata recording
+    result.evidence_bundle_metadata = {
+        "source_type": source_type or ("offline_fixture" if not url_login and not url_careers and not url_docs else "verified_source" if (url_login or url_careers or url_docs) else "UNKNOWN"),
+        "collection_method": collection_method or ("offline_injection" if not url_login else "web_scrape_verified"),
+        "collected_at": collected_at or "UNKNOWN",
+    }
 
     # Check competitor or consumer disqualification
     disq_reason = detect_competitor_or_disqualification(all_html, company_name=company_name, domain=domain)
@@ -449,7 +577,8 @@ def evaluate_devtools_prospect(
         result.icp_fit = "NON_ICP"
         result.use_case_fit = "NONE"
         result.qualification_status = "DISQUALIFIED"
-        result.evidence_quality = "SUFFICIENT" if all_html else "PARTIAL"
+        pages_with_content = sum(1 for p in [html_login, html_careers, html_docs] if p and p.strip())
+        result.evidence_quality = "SUFFICIENT" if pages_with_content >= 2 else ("PARTIAL" if pages_with_content == 1 else "INSUFFICIENT")
         result.next_best_research_action = "DISCARD_OR_ARCHIVE"
         return result
 
@@ -489,15 +618,24 @@ def evaluate_devtools_prospect(
 
     result.extracted_signals = extracted
 
-    # ── Multi-Source Deduplication & Evidence Sufficiency ──────────────
+        # ── Multi-Source Deduplication & Evidence Sufficiency ──────────────
     # Deduplicate: Multiple mentions on a single page or duplicate page content
     # must NOT count as distinct independent sources.
-    verified_sources = set()
+    # Source classification:
+    # - verified_source: real verified URLs with non-empty schema and domain
+    # - offline_fixture: explicit offline fixture records
+    # - unverified_source: text provided without verified URL (never counted as independent real collection)
+    verified_sources: set[str] = set()
+    offline_fixture_sources: set[str] = set()
+    unverified_sources: set[str] = set()
     seen_content_hashes = set()
+
+    # Filter out closed/stale job postings from active careers signals
+    careers_is_closed = any(p.search(html_careers) for p in CLOSED_JOB_MARKERS) if html_careers else False
 
     raw_pages = [
         ("login", url_login, html_login),
-        ("careers", url_careers, html_careers),
+        ("careers", url_careers, html_careers if not careers_is_closed else ""),
         ("docs", url_docs, html_docs),
     ]
 
@@ -509,27 +647,50 @@ def evaluate_devtools_prospect(
             # Duplicate page content across endpoints does not inflate sources
             continue
         seen_content_hashes.add(chash)
-        if p_url and p_url != "UNKNOWN":
-            verified_sources.add(p_url)
+        p_url_clean = p_url.strip() if p_url else ""
+        if p_url_clean and p_url_clean != "UNKNOWN":
+            if p_url_clean.startswith("http://") or p_url_clean.startswith("https://"):
+                verified_sources.add(p_url_clean)
+            else:
+                offline_fixture_sources.add(p_url_clean)
         else:
-            verified_sources.add(f"unverified_source_{page_name}")
+            unverified_sources.add(f"unverified_{page_name}")
 
     # DNS SPF alone is only a configuration clue, not an independent web evidence source
-    if spf_res and len(verified_sources) > 0:
-        verified_sources.add("dns_spf_config")
+    dns_ident = None
+    if spf_res:
+        dns_ident = dns_source.strip() if dns_source and dns_source.strip() else f"dns:spf:{domain}"
+        if dns_ident != "UNKNOWN":
+            verified_sources.add(dns_ident)
 
-    source_count = len(verified_sources)
+    result.source_breakdown = {
+        "verified_source": sorted(list(verified_sources)),
+        "offline_fixture": sorted(list(offline_fixture_sources)),
+        "unverified_source": sorted(list(unverified_sources)),
+    }
+
+    # Only verified sources (and distinct offline fixtures) count toward independent sources.
+    # Unverified sources (missing URL) MUST NOT be counted as valid independent sources.
+    # Furthermore, web page evidence must have at least 2 independent pages for SUFFICIENT;
+    # 1 web page + DNS SPF only yields PARTIAL evidence (per W1-03 qualification contract).
+    web_sources = {s for s in (verified_sources | offline_fixture_sources) if s != dns_ident}
+    valid_independent_sources = verified_sources | offline_fixture_sources
+    source_count = len(valid_independent_sources)
     result.independent_source_count = source_count
 
-    if source_count >= 2:
+    if len(web_sources) >= 2:
         result.evidence_quality = "SUFFICIENT"
-    elif source_count == 1:
-        if spf_res and not all_html:
-            result.evidence_quality = "INSUFFICIENT"
-        else:
-            result.evidence_quality = "PARTIAL"
+    elif len(web_sources) == 1:
+        result.evidence_quality = "PARTIAL"
+    elif spf_res:
+        result.evidence_quality = "INSUFFICIENT"
     else:
         result.evidence_quality = "INSUFFICIENT"
+
+    # Missing metadata note: If collected_at or collection_method is missing, record in unknown_fields
+    if not collected_at or collected_at == "UNKNOWN":
+        if "COLLECTED_AT_TIMESTAMP" not in result.unknown_fields:
+            result.unknown_fields.append("COLLECTED_AT_TIMESTAMP")
 
     # Determine Use Case Fit & ICP fit
     if agent_res:
@@ -742,6 +903,8 @@ class DevToolsPipelineAdapter:
                     purchase_evidence=ev_data.get("purchase_evidence", []),
                     final_redirects=ev_data.get("final_redirects", {}),
                     collected_at=ev_data.get("collected_at", ""),
+                    source_type=ev_data.get("source_type", ""),
+                    collection_method=ev_data.get("collection_method", ""),
                 )
 
                 obs_count = await record_devtools_observations(

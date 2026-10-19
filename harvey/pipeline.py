@@ -96,6 +96,7 @@ async def run_prospecting(
     devtools: bool = False,
     devtools_limit: int = 50,
     devtools_evidence: dict | None = None,
+    offline_evidence_only: bool = False,
     dry_run: bool = False,
 ) -> PipelineReport:
     """Discover businesses, then read what their websites say about them.
@@ -104,6 +105,13 @@ async def run_prospecting(
     queries the database for what needs attention, so it also sweeps up
     anything an earlier run left unfinished.
     """
+    if offline_evidence_only:
+        return await run_offline_prospecting(
+            state=state,
+            evidence_bundle=devtools_evidence,
+            limit=devtools_limit,
+        )
+
     from harvey.collectors.discover import DEFAULT_PROVIDER, run_discovery
 
     report = PipelineReport()
@@ -154,5 +162,54 @@ async def run_prospecting(
         except Exception as e:
             logger.exception("devtools stage failed")
             report.errors.append(f"devtools: {e}")
+
+    return report
+
+
+async def run_offline_prospecting(
+    state,
+    evidence_bundle: dict | None = None,
+    limit: int = 50,
+) -> PipelineReport:
+    """Offline Evidence-Only execution entrypoint for DevTools and FetchInbox signals.
+
+    Strictly guarantees zero unapproved outbound network access:
+    - Discovery, profiling, DNS queries, and external scraping are completely bypassed.
+    - An outermost network guard blocks any outbound socket, DNS, or HTTP calls.
+    - Injected evidence bundles or pre-existing SQLite company records are fed
+      directly into DevToolsPipelineAdapter.
+    - Yields standard PipelineReport with observations recorded in SQLite.
+    """
+    from harvey.collectors.devtools import (
+        DevToolsPipelineAdapter,
+        offline_network_guard,
+        OutboundCallTracker,
+    )
+
+    report = PipelineReport()
+    report.discover = {"found": 0, "queries": 0, "new_companies": 0, "actual_cost": 0.0, "mode": "offline_evidence_only"}
+    report.skipped = "discovery and profiling bypassed in offline evidence-only mode"
+
+    if evidence_bundle is None:
+        evidence_bundle = {}
+
+    tracker = OutboundCallTracker()
+    with offline_network_guard(tracker):
+        try:
+            adapter = DevToolsPipelineAdapter(state, evidence_bundle=evidence_bundle)
+            res = await adapter.run(limit=limit)
+            report.devtools_companies = res.evaluated_companies
+            report.devtools_observations = res.recorded_observations
+            report.devtools_run_id = res.run_id
+            if res.errors:
+                report.errors.extend(res.errors)
+        except Exception as e:
+            logger.exception("offline prospecting run failed: %s", e)
+            report.errors.append(f"offline_prospecting: {e}")
+
+    if tracker.call_count > 0:
+        err = f"CRITICAL SECURITY VIOLATION: {tracker.call_count} outbound calls intercepted during offline run!"
+        report.errors.append(err)
+        logger.critical(err)
 
     return report

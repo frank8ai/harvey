@@ -119,3 +119,30 @@ run_prospecting(state, config, devtools=True, devtools_evidence=bundle)
   - 本地离线流水线已完全通畅，提供真实有效的结构化 Observation 与 OpportunityCard。
   - **前置依赖提示**：PR #2 本身业务逻辑完整且自洽，但在真实出站前，必须等待安全基础层 PR #1 (`codex/w1-02-harvey-safety-hardening`) 合并以保障物理发信锁与 SSRF 安全传输；严禁在未集成 PR #1 时连接真实外网。
 - **最终裁决**：**MERGE_READY**（针对 PR #2 分支自身的离线工程闭环已达标，建议通过 `gh stack` 与 PR #1 联合审查，暂不自行合入主干）。
+
+
+---
+
+## 六、W1-03-R2 升级报告：Offline Evidence-Only 严格模式与来源真实性
+
+### 1. P0-A 真实离线入口与最外层网络阻断
+1. **显式离线执行入口**：`run_offline_prospecting(state, evidence_bundle=..., limit=...)`，同时支持 `run_prospecting(..., offline_evidence_only=True)`。
+2. **最外层阻断网络**：`offline_network_guard` 集中拦截 socket 连接、DNS 解析、httpcore HTTP 同步/异步请求、urllib 以及 asyncio 连接。仅允许本地回环地址（127.0.0.1、localhost、::1）供 SQLite/IPC 使用。
+3. **真实调用链**：
+   `run_offline_prospecting() -> offline_network_guard -> DevToolsPipelineAdapter.run() -> evaluate_devtools_prospect() -> record_devtools_observations() -> SQLite Observations -> Cohort / OpportunityCard`。
+   完全规避 Discovery、Profile、DNS 查询与模型调用，禁止任何偷跑公网逻辑。
+4. **状态隔离与幂等性**：相同输入重复运行不会造成 companies 表或 observations 表脏数据污染，重复运行后企业记录去重数稳定。
+
+### 2. P1-A 证据来源真实性规范
+1. **来源分类机制**：严格区分 `verified_source`、`offline_fixture` 与 `unverified_source`。
+2. **拒绝未核实证据膨胀**：未提供有效真实 URL 的文本放入 `unverified_source`，其独立来源计数为 0，不能作为提升 `SUFFICIENT` 的依据。
+3. **证据指纹去重**：同一来源或不同端点出现的相同内容哈希不提升独立来源计数。
+4. **元数据溯源**：Evidence Bundle 记录 `source_type`、`collection_method` 与 `collected_at`；缺失时在 `unknown_fields` 记录证据缺口（如 `COLLECTED_AT_TIMESTAMP`）。
+5. **采购意图硬门禁**：`purchase_evidence` 严格输出 `PURCHASE_CANDIDATE_PENDING_VERIFICATION`，绝不因技术栈或非空列表自动断言为已确认买家。
+6. **负例与 UNKNOWN 保留**：空输入返回 `UNKNOWN`，9 类正负样本分类与预期契约 100% 吻合。
+
+### 3. 测试验证数据
+- **物理验收环境**：Windows 11 / Python 3.14.5 / aiosqlite / pytest-9.1.1
+- **DevTools 核心与信号测试**：`tests/test_devtools_collector.py`、`tests/test_devtools_signals.py` 全部通过。
+- **离线端到端测试**：`tests/test_devtools_pipeline_e2e.py` 3 项测试全部通过，外层拦截断言 outbound requests = 0。
+- **Harvey 全量回归**：`403 passed, 169 skipped, 0 failed`（耗时 108.58s）。

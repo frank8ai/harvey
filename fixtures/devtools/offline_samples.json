@@ -22,7 +22,10 @@
       "has_intent": false,
       "disqualified": false,
       "qualification_status": "POTENTIAL_FIT"
-    }
+    },
+    "collected_at": "2026-10-19T08:00:00Z",
+    "source_type": "offline_fixture",
+    "collection_method": "curated_offline_fixture"
   },
   "procurement_candidate": {
     "domain": "enterprise-agent.dev",
@@ -52,7 +55,10 @@
       "has_intent": true,
       "disqualified": false,
       "qualification_status": "PURCHASE_CANDIDATE_PENDING_VERIFICATION"
-    }
+    },
+    "collected_at": "2026-10-19T08:00:00Z",
+    "source_type": "offline_fixture",
+    "collection_method": "curated_offline_fixture"
   },
   "ai_browser_agent": {
     "domain": "browserworker.ai",
@@ -77,7 +83,10 @@
       "has_intent": false,
       "disqualified": false,
       "qualification_status": "POTENTIAL_FIT"
-    }
+    },
+    "collected_at": "2026-10-19T08:00:00Z",
+    "source_type": "offline_fixture",
+    "collection_method": "curated_offline_fixture"
   },
   "qa_agency": {
     "domain": "qualitest-labs.dev",
@@ -102,7 +111,10 @@
       "has_intent": false,
       "disqualified": false,
       "qualification_status": "POTENTIAL_FIT"
-    }
+    },
+    "collected_at": "2026-10-19T08:00:00Z",
+    "source_type": "offline_fixture",
+    "collection_method": "curated_offline_fixture"
   },
   "direct_competitor": {
     "domain": "testmailtemp.io",
@@ -128,7 +140,10 @@
       "disqualified": true,
       "disqualified_reason": "DIRECT_COMPETITOR",
       "qualification_status": "DISQUALIFIED"
-    }
+    },
+    "collected_at": "2026-10-19T08:00:00Z",
+    "source_type": "offline_fixture",
+    "collection_method": "curated_offline_fixture"
   },
   "consumer_fashion": {
     "domain": "cozythreads-apparel.com",
@@ -154,7 +169,10 @@
       "disqualified": true,
       "disqualified_reason": "CONSUMER_ONLY",
       "qualification_status": "DISQUALIFIED"
-    }
+    },
+    "collected_at": "2026-10-19T08:00:00Z",
+    "source_type": "offline_fixture",
+    "collection_method": "curated_offline_fixture"
   },
   "local_dentist": {
     "domain": "denver-smiles-clinic.com",
@@ -180,7 +198,10 @@
       "disqualified": true,
       "disqualified_reason": "CONSUMER_ONLY",
       "qualification_status": "DISQUALIFIED"
-    }
+    },
+    "collected_at": "2026-10-19T08:00:00Z",
+    "source_type": "offline_fixture",
+    "collection_method": "curated_offline_fixture"
   },
   "stale_hiring_saas": {
     "domain": "cloudledger.net",
@@ -205,7 +226,10 @@
       "has_intent": false,
       "disqualified": false,
       "qualification_status": "POTENTIAL_FIT"
-    }
+    },
+    "collected_at": "2026-10-19T08:00:00Z",
+    "source_type": "offline_fixture",
+    "collection_method": "curated_offline_fixture"
   },
   "single_page_duplication": {
     "domain": "agenticops.dev",
@@ -228,6 +252,9 @@
       "has_intent": false,
       "disqualified": false,
       "qualification_status": "POTENTIAL_FIT"
-    }
+    },
+    "collected_at": "2026-10-19T08:00:00Z",
+    "source_type": "offline_fixture",
+    "collection_method": "curated_offline_fixture"
   }
 }

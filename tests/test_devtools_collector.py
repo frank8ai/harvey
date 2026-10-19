@@ -170,6 +170,14 @@ def test_source_url_integrity_marks_unknown_when_not_provided():
         # Must NOT invent https://unvisited.dev/login when not verified
         assert sig["source_url"] == "UNKNOWN"
 
+    # P1-A source integrity: unverified sources do NOT count as independent sources!
+    assert res.independent_source_count == 0
+    assert res.evidence_quality == "INSUFFICIENT"
+    assert "unverified_login" in res.source_breakdown["unverified_source"]
+    assert "unverified_careers" in res.source_breakdown["unverified_source"]
+    assert len(res.source_breakdown["verified_source"]) == 0
+    assert "COLLECTED_AT_TIMESTAMP" in res.unknown_fields
+
 
 # ── Requirement 6: Single page or duplicated content does not inflate sources ──
 def test_single_page_duplication_counts_as_one_source(offline_fixtures):
