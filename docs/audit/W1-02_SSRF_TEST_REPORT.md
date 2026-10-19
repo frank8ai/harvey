@@ -1,43 +1,54 @@
-# W1-02_SSRF_TEST_REPORT.md — SSRF 传输层防御与不可信 URL 安全评测报告
+# W1-02_SSRF_TEST_REPORT.md — SSRF 传输层防御、全入口覆盖矩阵与安全评测报告
 
-> **审计执行人**：Principal Python Security Engineer & Independent Security Auditor  
-> **评测对象**：Harvey 传输层 HTTP 客户端与不可信 URL 解析模块 (`harvey/security_ssrf.py`, `harvey/collectors/profile.py`)  
-> **基准 SHA**：`e114e95471b1bf155454fca108f0730b66a47a01`  
-> **测试状态**：14/14 全通过，零失败  
+> **审计执行人**：Principal Python Security Engineer & Independent Security Auditor
+> **评测对象**：Harvey 传输层 HTTP 客户端与不可信 URL 解析模块 (`harvey/security_ssrf.py`, `harvey/collectors/discover.py`, `harvey/collectors/profile.py`)
+> **基准 SHA**：`e114e95471b1bf155454fca108f0730b66a47a01`
+> **加固分支**：`codex/w1-02-harvey-safety-hardening`
+> **测试状态**：18/18 安全测试全通过，零失败
 > **安全裁决状态**：`SSRF_TRANSPORT_GUARD_VERIFIED: TRUE` / `READY_FOR_CONTROLLED_DISCOVERY: FALSE (BLOCKED)`
 
 ---
 
-## 1. 威胁建模与攻击面分析 (Threat Modeling)
+## 1. 威胁建模与全入口覆盖矩阵 (Ingress Coverage Matrix)
 
-Harvey 的 FetchInbox 自用阶段涉及对潜在客户企业官网及其 `sitemap.xml`、`robots.txt`、careers 页面发起 HTTP 抓取。潜在攻击者可能通过以下手段实施 SSRF：
-1. **本机回环访问 (Localhost / Loopback Probe)**：
-   指向 `127.0.0.1`、`localhost`、`::1`、`0.0.0.0`，试图刺探 Harvey 自身开放的本地 Dashboard (`127.0.0.1:5555`) 或宿主机其他微服务。
-2. **私有内网探测 (RFC1918 Private Subnets)**：
-   指向 `10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16`，探测局域网内部未授权服务。
-3. **云厂商元数据盗取 (Cloud Metadata Exfiltration)**：
-   指向 `169.254.169.254`（AWS/GCP/Azure/OpenStack Instance Metadata），试图盗取 IAM 凭证与主机密钥。
-4. **IPv4 映射的 IPv6 规避 (IPv4-mapped IPv6 Bypass)**：
-   使用 `::ffff:127.0.0.1` 或 `::ffff:169.254.169.254` 绕过仅检查点分十进制的简陋正则表达式。
-5. **DNS 重绑定攻击 (DNS Rebinding TOCTOU)**：
-   域名第一次 DNS 查询返回公网 IP，在连接建立前 DNS 记录被篡改为 `127.0.0.1`；如果先做 URL 检查再发起 HTTP 请求，将产生经典 TOCTOU 漏洞。
-6. **HTTP 30x 重定向绕过 (Open Redirect SSRF)**：
-   初次请求公网合法 URL，服务端返回 302 重定向至内网目标 `http://169.254.169.254/latest/meta-data/`。
+Harvey 涉及对外 HTTP 请求的入口已进行系统性梳理与防御分类：
+
+| 模块/函数 | 目标 URL 类型 | 防护机制 | 状态/保护级别 |
+|---|---|---|---|
+| `harvey/collectors/profile.py` (`ProfileCollector.profile`) | 目标企业官网、不可信重定向目标、`robots.txt`、`sitemap.xml` | `SSRFSafeTransport` 强绑定 Socket 层 IP 检查 | **PROTECTED (Fully Guarded)** |
+| `harvey/collectors/discover.py` (`geocode_city`) | Nominatim 地理编码服务 (`nominatim.openstreetmap.org`) | `SSRFSafeTransport` 强绑定 Socket 层 IP 检查 | **PROTECTED (Fully Guarded)** |
+| `harvey/collectors/discover.py` (`run_discovery`) | SERP / Overpass / DataForSEO 采集网关 | `SSRFSafeTransport` 强绑定 Socket 层 IP 检查 | **PROTECTED (Fully Guarded)** |
+| `harvey/collectors/discover.py` (`run_discovery(dry_run=True)`) | 离线评估模式 | 拦截联网地理编码，仅用本地缓存，严格 0 网络请求 | **PROTECTED (Offline Airgap)** |
+| `harvey/integrations/instantly.py` | Instantly SaaS API | 所有变更方法 (`POST`, `PATCH`, `DELETE`, `PUT`) 物理拦截断流 | **BLOCKED (Zero Mutation)** |
+| `harvey/integrations/email_finder.py` (`verify_email_smtp`) | 外部 MX 25 端口主动探测 | 物理拦截断流，记录日志直接返回 None | **BLOCKED (Zero Outbound)** |
+| `harvey/integrations/gmail.py` (`GmailProvider.send_email`) | Google Workspace REST API | 物理拦截硬锁，直接返回 Fail-Closed SendResult | **BLOCKED (Zero Outbound)** |
+| `harvey/integrations/smtp_mail.py` (`SmtpImapProvider.send_email`) | 外部 SMTP 服务器 (25/465/587) | 物理拦截硬锁，直接返回 Fail-Closed SendResult | **BLOCKED (Zero Outbound)** |
+| `harvey/integrations/microsoft.py` (`MicrosoftProvider.send_email`) | Microsoft Graph API | 物理拦截硬锁，直接返回 Fail-Closed SendResult | **BLOCKED (Zero Outbound)** |
+| `harvey/agents/scout.py` | 外部商机抓取 (Scout) | 实验禁发与 W1-04 离线门禁限制，未在受控白名单前禁发 | **BLOCKED (Stage Gated)** |
 
 ---
 
 ## 2. 传输层阻断架构实现 (`harvey/security_ssrf.py`)
 
-为根治 TOCTOU 与重定向穿透，本方案放弃应用层字符串正则匹配，选择在底层 Socket 连接边界实施拦截：
+为根治 TOCTOU 与重定向穿透，本方案放弃脆弱的应用层字符串正则匹配，选择在底层 Socket 连接边界实施拦截：
 
 ### 2.1 架构设计
 - **`SSRFSafeNetworkBackend(httpcore.AnyIOBackend)`**：
   在 `connect_tcp(host, port)` 时执行确定性 DNS 解析；
-- **全网段合法性断言 (`is_safe_ip`)**：
+- **全网段与协议变体合法性断言 (`is_safe_ip`)**：
   利用 Python 原生 `ipaddress.ip_address` 对解析出的全部目标 IP 逐一检查：
   ```python
-  if ip.version == 6 and ip.ipv4_mapped:
-      ip = ip.ipv4_mapped
+  if ip.version == 6:
+      if ip.ipv4_mapped:
+          return is_safe_ip(str(ip.ipv4_mapped))
+      if ip.packed.startswith(b"\x00" * 12) and ip != ipaddress.IPv6Address("::"):
+          return is_safe_ip(str(ipaddress.IPv4Address(ip.packed[12:])))
+      if ip.sixtofour:
+          return is_safe_ip(str(ip.sixtofour))
+      if ip.teredo:
+          server, client = ip.teredo
+          if not is_safe_ip(str(server)) or not is_safe_ip(str(client)):
+              return False
   if not ip.is_global:
       return False
   if ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
@@ -62,6 +73,8 @@ Harvey 的 FetchInbox 自用阶段涉及对潜在客户企业官网及其 `sitem
 | `test_ssrf_blocks_private_subnets` | `10.200.1.5`, `172.20.10.2`, `192.168.100.50` | 抛出 `SSRFBlockedError`，严格阻断 | **PASS** |
 | `test_ssrf_blocks_dns_rebinding` | 模拟首包返回 `93.184.216.34`，二次解析返回 `127.0.0.1` | 在重绑定为回环地址时抛出 `SSRFBlockedError` | **PASS** |
 | `test_ssrf_blocks_redirect_to_internal` | 302 Redirect 跳转至 `http://127.0.0.1:8080/secret` | 在遵循重定向发起新 TCP 连接时被传输层拦截 | **PASS** |
+| `test_ssrf_blocks_ipv4_compatible_and_subtle_variants` | `::127.0.0.1`, `::169.254.169.254`, `::10.0.0.1`, `fd00:ec2::254` | 深度 IPv6 兼容与云元数据格式识别并阻断 | **PASS** |
+| `test_discovery_dry_run_zero_external_network_calls` | Discovery dry_run 评估 | 零外部网络请求，坐标缺失时拒绝离线联网 | **PASS** |
 
 ---
 
@@ -70,4 +83,4 @@ Harvey 的 FetchInbox 自用阶段涉及对潜在客户企业官网及其 `sitem
 1. **当前阶段裁决**：
    `READY_FOR_CONTROLLED_DISCOVERY: FALSE (BLOCKED)`
 2. **原因说明**：
-   虽然 Profile 采集器传输层已经具备 SSRF 物理拦截器，但在未获得上级明确授权、未配置特定可信白名单以及未建立每日出网流量硬顶前，Harvey 依然禁止发起未经受控的真实公网爬取。
+   虽然 Discover 与 Profile 采集器传输层已经具备 SSRF 物理拦截器且覆盖全入口，但在未证明全路径安全、未获得上级明确授权、未配置特定可信白名单以及未建立每日出网流量硬顶前，`CONTROLLED_DISCOVERY` 必须保持严格 `BLOCKED`。

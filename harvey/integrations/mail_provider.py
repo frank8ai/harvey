@@ -19,10 +19,18 @@ it isn't a MailProvider because Instantly owns sequencing/sending itself.
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from enum import Enum
 
 logger = logging.getLogger("harvey.mail")
 
 NATIVE_PROVIDERS = ("gmail", "smtp", "microsoft", "dry_run")
+
+
+class ExecutionStatus(str, Enum):
+    """Explicit status contract separating external execution from internal simulation."""
+    BLOCKED = "blocked"
+    SIMULATED = "simulated"
+    SENT_CONFIRMED = "sent_confirmed"
 
 
 @dataclass
@@ -31,6 +39,7 @@ class SendResult:
     message_id: str = ""     # RFC Message-ID (or provider id) of the sent mail
     thread_ref: str = ""     # provider thread handle (Gmail threadId, etc.)
     error: str = ""
+    execution_status: ExecutionStatus = ExecutionStatus.SENT_CONFIRMED
 
 
 @dataclass
@@ -131,7 +140,12 @@ class DryRunMailProvider(MailProvider):
             to_email,
             subject[:40],
         )
-        return SendResult(ok=True, message_id=msg_id, thread_ref=t_ref)
+        return SendResult(
+            ok=False,
+            message_id=msg_id,
+            thread_ref=t_ref,
+            execution_status=ExecutionStatus.SIMULATED,
+        )
 
     async def get_replies(self, limit: int = 50) -> list[InboundMessage]:
         return self.inbound_messages[:limit]

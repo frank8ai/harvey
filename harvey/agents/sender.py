@@ -20,7 +20,7 @@ from harvey.brain import Brain
 from harvey.config import HarveyConfig, EnvConfig
 from harvey.gate import pre_send_check
 from harvey.integrations.instantly import InstantlyClient
-from harvey.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider
+from harvey.integrations.mail_provider import ExecutionStatus, NATIVE_PROVIDERS, get_mail_provider
 from harvey.integrations.precleared import PreclearedClient
 from harvey.state import StateManager
 
@@ -241,9 +241,13 @@ class Sender:
                 logger.info(
                     f"Sender: Leads for '{campaign.name}' already staged. Retrying activation."
                 )
-                if await self.instantly.activate_campaign(campaign_id) is not None:
+                act_res = await self.instantly.activate_campaign(campaign_id)
+                if act_res is not None and not act_res.get("dry_run") and act_res.get("status") != "blocked_dry_run":
                     await self.state.update_campaign(campaign.id, status="active")
                     logger.info(f"Sender: Campaign '{campaign.name}' activated on retry.")
+                elif act_res is not None:
+                    await self.state.update_campaign(campaign.id, status="simulated")
+                    logger.info(f"Sender: Campaign '{campaign.name}' marked simulated (dry-run intercept).")
                 return
             logger.warning(f"Sender: No valid prospects for campaign {campaign.name}")
             return
@@ -292,12 +296,14 @@ class Sender:
                 "Leads are staged; will retry activation next cycle."
             )
             return
+        is_dry_run_campaign = bool(result.get("dry_run") or result.get("status") == "blocked_dry_run")
 
         # 5. Update our records
+        final_status = "simulated" if is_dry_run_campaign else "active"
         await self.state.update_campaign(
             campaign.id,
             instantly_campaign_id=campaign_id,
-            status="active",
+            status=final_status,
         )
 
         await self.state.log_action(
@@ -543,6 +549,21 @@ class Sender:
                 thread_ref=item.get("thread_ref", ""),
                 in_reply_to=item.get("in_reply_to", ""),
             )
+            if result.execution_status == ExecutionStatus.SIMULATED:
+                # P0-A: DryRun/Simulated sends must NOT pollute real sent counts or sent_at
+                await self.state.update_outbox_item(
+                    item["id"],
+                    status="simulated",
+                    error="SIMULATED: Captured in memory; zero live network egress.",
+                    message_id=result.message_id,
+                    thread_ref=result.thread_ref,
+                )
+                await self.state.log_action(
+                    action_type="email_simulated",
+                    agent="sender",
+                    details={"to": item["to_email"], "step": item["step"], "provider": self.provider.name},
+                )
+                continue
             if not result.ok:
                 await self.state.update_outbox_item(
                     item["id"], status="failed", error=result.error[:300]

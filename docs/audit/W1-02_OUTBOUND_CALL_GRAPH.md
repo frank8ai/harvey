@@ -1,9 +1,9 @@
 # W1-02_OUTBOUND_CALL_GRAPH.md — 全域出站外联调用链与副作用阻断拓扑
 
-> **审计执行人**：Principal Python Security Engineer & Independent Security Auditor  
-> **基准 SHA**：`e114e95471b1bf155454fca108f0730b66a47a01` (Upstream HEAD)  
-> **加固分支**：`codex/w1-02-harvey-safety-hardening`  
-> **审计日期**：2026-10-19  
+> **审计执行人**：Principal Python Security Engineer & Independent Security Auditor
+> **基准 SHA**：`e114e95471b1bf155454fca108f0730b66a47a01` (Upstream HEAD)
+> **加固分支**：`codex/w1-02-harvey-safety-hardening`
+> **审计日期**：2026-10-19
 > **安全裁决状态**：`OUTBOUND_SEND_PHYSICALLY_BLOCKED: TRUE` / `INSTANTLY_SIDE_EFFECTS_BLOCKED: TRUE`
 
 ---

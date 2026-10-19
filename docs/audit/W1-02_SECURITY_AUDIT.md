@@ -1,11 +1,11 @@
 # W1-02_SECURITY_AUDIT.md — 物理禁发、SSRF 防御与隔离运行安全审计综合报告
 
-> **执行角色**：Principal Python Security Engineer、AI Agent Runtime Architect、Independent Security Auditor  
-> **审计日期**：2026-10-19  
-> **目标仓库**：`frank8ai/harvey` (Upstream: `ethanplusai/harvey`)  
-> **基线 SHA (BASE_SHA)**：`e114e95471b1bf155454fca108f0730b66a47a01`  
-> **分支**：`codex/w1-02-harvey-safety-hardening`  
-> **环境状态**：Windows 11 Pro 64-bit / Python 3.13.13 / pytest-8.4.2 / pluggy-1.7.0  
+> **执行角色**：Principal Python Security Engineer、AI Agent Runtime Architect、Independent Security Auditor
+> **审计日期**：2026-10-19
+> **目标仓库**：`frank8ai/harvey` (Upstream: `ethanplusai/harvey`)
+> **基线 SHA (BASE_SHA)**：`e114e95471b1bf155454fca108f0730b66a47a01`
+> **分支**：`codex/w1-02-harvey-safety-hardening`
+> **环境状态**：Windows 11 Pro 64-bit / Python 3.13.13 / pytest-8.4.2 / pluggy-1.7.0
 > **最终安全裁决**：**CONDITIONAL GO** (出站物理禁发与 SSRF 阻断达成，离线能力就绪，公网爬取严格维持 BLOCKED)
 
 ---
@@ -19,7 +19,7 @@
 | 3 | **SSRF 与私网/回环/元数据阻断** | `SSRFSafeNetworkBackend` 在 `connect_tcp` 前解析 DNS，检查 `is_safe_ip`，并绑定安全 IP 直连 | **VERIFIED** |
 | 4 | **Dashboard 仅允许本机访问** | 源码显式绑定 `127.0.0.1:5555`，`docker-compose.yml` 强制绑定 `127.0.0.1:5555:5555` | **VERIFIED** |
 | 5 | **防范外部内容诱导执行命令** | 模型调用层强制剥离所有工具（`--tools ""` 与 `--strict-mcp-config`），剥离 Docker Socket 与高权凭据 | **VERIFIED** |
-| 6 | **已有离线能力零回归** | 567 项全量用例回归（398 passed / 169 skipped / 0 failed），原有 384 项测试 100% 保持通过 | **VERIFIED** |
+| 6 | **已有离线能力零回归** | 571 项全量用例回归（402 passed / 169 skipped / 0 failed），原有 384 项测试 100% 保持通过 | **VERIFIED** |
 
 ---
 
@@ -54,7 +54,7 @@
 12. **`docker-compose.yml`**：
     - 将 Dashboard 暴露端口限定绑定于本机回环 `127.0.0.1:5555:5555`。
 13. **`tests/test_w1_02_safety_hardening.py` (新增自动化测试)**：
-    - 包含 14 项完整端到端物理阻断断言测试。
+    - 包含 18 项完整端到端物理阻断断言测试。
 
 ---
 
@@ -76,7 +76,7 @@
 SKIPPED [147] tests	est_codex*.py (Codex provider not supported on Windows)
 SKIPPED [21] tests	est_codex_cli_surface.py (Requires HARVEY_CODEX_CLI_TESTS=1)
 SKIPPED [1] tests	est_packaging.py (Requires HARVEY_PACKAGE_TESTS=1)
-=========== 398 passed, 169 skipped, 1 warning in 122.79s (0:02:02) ===========
+=========== 402 passed, 169 skipped, 1 warning in 122.79s (0:02:02) ===========
 ```
 
 ---
@@ -123,7 +123,7 @@ SKIPPED [1] tests	est_packaging.py (Requires HARVEY_PACKAGE_TESTS=1)
 | `INSTANTLY_SIDE_EFFECTS_BLOCKED` | **TRUE** | `test_instantly_side_effects_physically_blocked` 验证通过 |
 | `SSRF_TRANSPORT_GUARD_VERIFIED` | **TRUE** | `test_ssrf_blocks_localhost_and_loopback`, `test_ssrf_blocks_cloud_metadata`, `test_ssrf_blocks_dns_rebinding`, `test_ssrf_blocks_redirect_to_internal` 全部通过 |
 | `DASHBOARD_LOCAL_ONLY` | **TRUE** | `test_dashboard_default_binding` 与 `docker-compose.yml` 验证通过 |
-| `FULL_TEST_SUITE_STATUS` | **398 PASS / 169 SKIP / 0 FAIL** | `pytest -ra` 实际全量运行输出 |
+| `FULL_TEST_SUITE_STATUS` | **402 PASS / 169 SKIP / 0 FAIL** | `pytest -ra` 实际全量运行输出 |
 | `READY_FOR_OFFLINE_W1-04` | **TRUE** | 数据库、Cohort、Signals、Outbox、Signals 离线逻辑完全正常 |
 | `READY_FOR_CONTROLLED_DISCOVERY` | **FALSE (BLOCKED)** | 严禁在未建立独立白名单授权与配额硬顶前开启真实网络爬取 |
 

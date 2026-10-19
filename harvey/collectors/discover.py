@@ -122,7 +122,9 @@ async def geocode_city(state, city: str, radius_km: int = 40,
         return "" if cached == "-" else f"{cached},{radius_km}"
 
     owned = client is None
-    client = client or httpx.AsyncClient(timeout=TIMEOUT)
+    if client is None:
+        from harvey.security_ssrf import SSRFSafeTransport
+        client = httpx.AsyncClient(timeout=TIMEOUT, transport=SSRFSafeTransport())
     try:
         r = await client.get(
             NOMINATIM,
@@ -707,13 +709,26 @@ async def run_discovery(
         raise ValueError(f"unknown discovery provider: {provider_key!r}")
 
     queries = queries or build_queries(config)
+    if dry_run:
+        # P0-B: dry_run must never perform external network geocoding; use existing coordinates only
+        needed_unresolved = [q.location for q in queries if q.location and not q.coordinate]
+        for q in queries:
+            if not q.coordinate and q.location:
+                cached = await state.get_setting(f"geo:{q.location.strip().lower()}")
+                if cached and cached != "-":
+                    q.coordinate = f"{cached},40"
+        unresolved_now = [q.location for q in queries if q.location and not q.coordinate]
+        if unresolved_now:
+            # Explicitly fail offline dry_run instead of silently sending geocoding HTTP requests
+            logger.info("run_discovery [dry_run]: missing cached coordinates for %s; skipping geocoding network calls.", unresolved_now)
+        report = DiscoveryReport(provider=provider_key, queries=len(queries))
+        report.estimated_cost = provider.estimate(queries)
+        return report
+
     if provider.kind == "listings":
         queries = await resolve_coordinates(state, queries)
     report = DiscoveryReport(provider=provider_key, queries=len(queries))
     report.estimated_cost = provider.estimate(queries)
-
-    if dry_run:
-        return report
 
     env = load_env().model_dump()
     if not provider.configured(env):
@@ -746,7 +761,9 @@ async def run_discovery(
 
     seen: set[str] = set()
     try:
-        async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True) as client:
+        from harvey.security_ssrf import SSRFSafeTransport
+        transport = SSRFSafeTransport()
+        async with httpx.AsyncClient(timeout=TIMEOUT, transport=transport, follow_redirects=True) as client:
             for i, query in enumerate(queries):
                 # The kill switch is read between batches, not once at the
                 # top: a long run has to be stoppable while it is running.

@@ -25,8 +25,19 @@ def is_safe_ip(ip_str: str) -> bool:
     """Return True if the IP address is globally routable and not in private/reserved ranges."""
     try:
         ip = ipaddress.ip_address(ip_str)
-        if ip.version == 6 and ip.ipv4_mapped:
-            ip = ip.ipv4_mapped
+        # Deep inspection of IPv6 encodings (IPv4-mapped, IPv4-compatible, 6to4, Teredo)
+        if ip.version == 6:
+            if ip.ipv4_mapped:
+                return is_safe_ip(str(ip.ipv4_mapped))
+            # IPv4-compatible IPv6 (deprecated but recognized, starts with 12 zero bytes)
+            if ip.packed.startswith(b"\x00" * 12) and ip != ipaddress.IPv6Address("::"):
+                return is_safe_ip(str(ipaddress.IPv4Address(ip.packed[12:])))
+            if ip.sixtofour:
+                return is_safe_ip(str(ip.sixtofour))
+            if ip.teredo:
+                server, client = ip.teredo
+                if not is_safe_ip(str(server)) or not is_safe_ip(str(client)):
+                    return False
         if not ip.is_global:
             return False
         if (
