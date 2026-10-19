@@ -19,7 +19,7 @@
 | 3 | **SSRF 与私网/回环/元数据阻断** | `SSRFSafeNetworkBackend` 在 `connect_tcp` 前解析 DNS，检查 `is_safe_ip`，并绑定安全 IP 直连 | **VERIFIED** |
 | 4 | **Dashboard 仅允许本机访问** | 源码显式绑定 `127.0.0.1:5555`，`docker-compose.yml` 强制绑定 `127.0.0.1:5555:5555` | **VERIFIED** |
 | 5 | **防范外部内容诱导执行命令** | 模型调用层强制剥离所有工具（`--tools ""` 与 `--strict-mcp-config`），剥离 Docker Socket 与高权凭据 | **VERIFIED** |
-| 6 | **已有离线能力零回归** | 571 项全量用例回归（402 passed / 169 skipped / 0 failed），原有 384 项测试 100% 保持通过 | **VERIFIED** |
+| 6 | **已有离线能力零回归** | 574 项全量用例回归（405 passed / 169 skipped / 0 failed），原有 384 项测试 100% 保持通过 | **VERIFIED** |
 
 ---
 
@@ -54,7 +54,7 @@
 12. **`docker-compose.yml`**：
     - 将 Dashboard 暴露端口限定绑定于本机回环 `127.0.0.1:5555:5555`。
 13. **`tests/test_w1_02_safety_hardening.py` (新增自动化测试)**：
-    - 包含 18 项完整端到端物理阻断断言测试。
+    - 包含 21 项完整端到端物理阻断断言测试（覆盖 Instantly 模拟状态防污染与 Scout 传输层 SSRF）。
 
 ---
 
@@ -64,7 +64,7 @@
 ```powershell
 ..\harvey_upstream\.venv\Scripts\python.exe -m pytest tests/test_w1_02_safety_hardening.py -v
 ```
-**结果**：`14 passed in 18.20s` (100% PASS)。
+**结果**：`21 passed in 19.21s` (100% PASS)。
 
 ### 2. 全量回归测试
 ```powershell
@@ -76,7 +76,7 @@
 SKIPPED [147] tests	est_codex*.py (Codex provider not supported on Windows)
 SKIPPED [21] tests	est_codex_cli_surface.py (Requires HARVEY_CODEX_CLI_TESTS=1)
 SKIPPED [1] tests	est_packaging.py (Requires HARVEY_PACKAGE_TESTS=1)
-=========== 402 passed, 169 skipped, 1 warning in 122.79s (0:02:02) ===========
+=========== 405 passed, 169 skipped, 1 warning in 112.30s (0:01:52) ===========
 ```
 
 ---
@@ -123,7 +123,7 @@ SKIPPED [1] tests	est_packaging.py (Requires HARVEY_PACKAGE_TESTS=1)
 | `INSTANTLY_SIDE_EFFECTS_BLOCKED` | **TRUE** | `test_instantly_side_effects_physically_blocked` 验证通过 |
 | `SSRF_TRANSPORT_GUARD_VERIFIED` | **TRUE** | `test_ssrf_blocks_localhost_and_loopback`, `test_ssrf_blocks_cloud_metadata`, `test_ssrf_blocks_dns_rebinding`, `test_ssrf_blocks_redirect_to_internal` 全部通过 |
 | `DASHBOARD_LOCAL_ONLY` | **TRUE** | `test_dashboard_default_binding` 与 `docker-compose.yml` 验证通过 |
-| `FULL_TEST_SUITE_STATUS` | **402 PASS / 169 SKIP / 0 FAIL** | `pytest -ra` 实际全量运行输出 |
+| `FULL_TEST_SUITE_STATUS` | **405 PASS / 169 SKIP / 0 FAIL** | `pytest -ra` 实际全量运行输出 |
 | `READY_FOR_OFFLINE_W1-04` | **TRUE** | 数据库、Cohort、Signals、Outbox、Signals 离线逻辑完全正常 |
 | `READY_FOR_CONTROLLED_DISCOVERY` | **FALSE (BLOCKED)** | 严禁在未建立独立白名单授权与配额硬顶前开启真实网络爬取 |
 

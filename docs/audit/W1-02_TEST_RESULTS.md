@@ -17,13 +17,13 @@
 
 | 统计指标 | 数量 | 占比 | 状态结论 |
 |---|---|---|---|
-| **Collected Tests (收集测试数)** | **571** | 100.0% | 在基线 553 项测试基础上，新增 18 项完整端到端安全物理阻断自动化用例 |
-| **PASSED (通过用例)** | **402** | 70.2% | 原有 384 项业务用例全部保持绿灯，新增 18 项安全用例 100% 通过 |
+| **Collected Tests (收集测试数)** | **574** | 100.0% | 在基线 553 项测试基础上，新增 21 项完整端到端安全物理阻断自动化用例 |
+| **PASSED (通过用例)** | **405** | 70.2% | 原有 384 项业务用例全部保持绿灯，新增 21 项安全用例 100% 通过 |
 | **SKIPPED (跳过用例)** | **169** | 29.8% | 保持原版 169 项平台特异性跳过（绝无假通过，详见第 2 节分类） |
 | **FAILED (失败用例)** | **0** | 0.0% | 现有逻辑与新加固逻辑零失败、零崩溃 |
 | **ERRORS (执行报错)** | **0** | 0.0% | 零执行错误 |
 | **Warnings (警告)** | **1** | - | `StarletteDeprecationWarning: Using httpx with starlette.testclient is deprecated` |
-| **总执行耗时** | **126.98 秒** (0:02:02) | - | 全量回归通过 |
+| **总执行耗时** | **112.30 秒** (0:02:02) | - | 全量回归通过 |
 
 ---
 
@@ -67,3 +67,6 @@
 | 16 | `test_simulated_email_idempotent_execution_zero_egress` | 模拟发送幂等重复执行，零外网流量，sent 计数严格为 0 | **PASSED** |
 | 17 | `test_discovery_dry_run_zero_external_network_calls` | Discovery dry_run 模式零外部网络请求（地理编码拒绝离线联网） | **PASSED** |
 | 18 | `test_ssrf_blocks_ipv4_compatible_and_subtle_variants` | SSRF 阻断 IPv4-compatible (`::127.0.0.1`) 与云元数据变体 | **PASSED** |
+| 19 | `test_instantly_simulation_never_pollutes_prospect_status_or_campaign_id` | Instantly 模拟运行零污染 Prospect 状态、零泄漏模拟 Campaign ID、记录专用 `campaign_simulated` 审计事件 | **PASSED** |
+| 20 | `test_scout_fetch_enforces_ssrf_protection_boundary` | Scout._fetch 传输层强制拦截回环、内网、元数据、IPv4 映射/兼容变体 | **PASSED** |
+| 21 | `test_scout_fetch_blocks_dns_rebinding` | Scout._fetch DNS 重绑定在 Socket 连接边界前被安全解析器拦截 | **PASSED** |

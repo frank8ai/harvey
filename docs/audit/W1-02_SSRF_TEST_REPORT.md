@@ -4,7 +4,7 @@
 > **评测对象**：Harvey 传输层 HTTP 客户端与不可信 URL 解析模块 (`harvey/security_ssrf.py`, `harvey/collectors/discover.py`, `harvey/collectors/profile.py`)
 > **基准 SHA**：`e114e95471b1bf155454fca108f0730b66a47a01`
 > **加固分支**：`codex/w1-02-harvey-safety-hardening`
-> **测试状态**：18/18 安全测试全通过，零失败
+> **测试状态**：21/21 安全测试全通过，零失败
 > **安全裁决状态**：`SSRF_TRANSPORT_GUARD_VERIFIED: TRUE` / `READY_FOR_CONTROLLED_DISCOVERY: FALSE (BLOCKED)`
 
 ---
@@ -24,7 +24,7 @@ Harvey 涉及对外 HTTP 请求的入口已进行系统性梳理与防御分类�
 | `harvey/integrations/gmail.py` (`GmailProvider.send_email`) | Google Workspace REST API | 物理拦截硬锁，直接返回 Fail-Closed SendResult | **BLOCKED (Zero Outbound)** |
 | `harvey/integrations/smtp_mail.py` (`SmtpImapProvider.send_email`) | 外部 SMTP 服务器 (25/465/587) | 物理拦截硬锁，直接返回 Fail-Closed SendResult | **BLOCKED (Zero Outbound)** |
 | `harvey/integrations/microsoft.py` (`MicrosoftProvider.send_email`) | Microsoft Graph API | 物理拦截硬锁，直接返回 Fail-Closed SendResult | **BLOCKED (Zero Outbound)** |
-| `harvey/agents/scout.py` | 外部商机抓取 (Scout) | 实验禁发与 W1-04 离线门禁限制，未在受控白名单前禁发 | **BLOCKED (Stage Gated)** |
+| `harvey/agents/scout.py` (`Scout._fetch`) | 外部商机抓取与网页检索 (Scout) | `SSRFSafeTransport` 强绑定 Socket 层 IP 检查 | **PROTECTED (Fully Guarded)** |
 
 ---
 
@@ -75,6 +75,8 @@ Harvey 涉及对外 HTTP 请求的入口已进行系统性梳理与防御分类�
 | `test_ssrf_blocks_redirect_to_internal` | 302 Redirect 跳转至 `http://127.0.0.1:8080/secret` | 在遵循重定向发起新 TCP 连接时被传输层拦截 | **PASS** |
 | `test_ssrf_blocks_ipv4_compatible_and_subtle_variants` | `::127.0.0.1`, `::169.254.169.254`, `::10.0.0.1`, `fd00:ec2::254` | 深度 IPv6 兼容与云元数据格式识别并阻断 | **PASS** |
 | `test_discovery_dry_run_zero_external_network_calls` | Discovery dry_run 评估 | 零外部网络请求，坐标缺失时拒绝离线联网 | **PASS** |
+| `test_scout_fetch_enforces_ssrf_protection_boundary` | Scout._fetch 访问回环、内网、元数据、IPv6 变体 | 传输层捕获 SSRFBlockedError，干净返回 None，零网络外泄 | **PASS** |
+| `test_scout_fetch_blocks_dns_rebinding` | Scout._fetch 遭遇 DNS 重绑定至 127.0.0.1 | 传输层捕获并阻断，干净返回 None | **PASS** |
 
 ---
 

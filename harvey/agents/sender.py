@@ -148,6 +148,7 @@ class Sender:
 
         # 1. Create campaign in Instantly — or resume one from a previous
         # partially-failed deploy. Never create a duplicate.
+        is_simulated = False
         campaign_id = campaign.instantly_campaign_id
         if campaign_id:
             logger.info(
@@ -160,15 +161,26 @@ class Sender:
                 logger.error(f"Sender: Failed to create Instantly campaign: {campaign.name}")
                 return
 
-            campaign_id = instantly_campaign.get("id")
-            if not campaign_id:
-                logger.error("Sender: No campaign ID returned from Instantly.")
-                return
-
-            # Persist the ID immediately so a crash mid-deploy resumes this
-            # campaign instead of creating a second one (double-send guard).
-            await self.state.update_campaign(campaign.id, instantly_campaign_id=campaign_id)
-            campaign.instantly_campaign_id = campaign_id
+            raw_id = instantly_campaign.get("id") or ""
+            is_simulated = bool(
+                instantly_campaign.get("dry_run")
+                or instantly_campaign.get("simulated")
+                or raw_id.startswith("dryrun-")
+                or raw_id.startswith("simulated-")
+            )
+            campaign_id = raw_id
+            if not is_simulated:
+                if not campaign_id:
+                    logger.error("Sender: No campaign ID returned from Instantly.")
+                    return
+                # Persist real remote campaign ID only
+                await self.state.update_campaign(campaign.id, instantly_campaign_id=campaign_id)
+                campaign.instantly_campaign_id = campaign_id
+            else:
+                logger.info(
+                    f"Sender: [SIMULATION] Ephemeral simulated campaign ID {campaign_id!r} "
+                    f"generated for '{campaign.name}'. Not persisted to state."
+                )
 
         # 2. Set email sequence
         sequences = [
@@ -184,6 +196,8 @@ class Sender:
         if result is None:
             logger.error(f"Sender: Failed to set emails for campaign {campaign_id}")
             return
+        if result.get("dry_run") or result.get("simulated"):
+            is_simulated = True
 
         # 3. Add leads — validated, deduped, never-contacted, deliverable-only
         allow_risky = getattr(self.config.channels.email, "send_to_risky", False)
@@ -232,11 +246,13 @@ class Sender:
             # Retry path: leads were already staged and marked 'contacted'
             # on a previous cycle but activation failed. Just activate.
             already_staged = False
-            for pid in campaign.prospect_ids:
-                p = await self.state.get_prospect(pid)
-                if p and p.status == "contacted":
-                    already_staged = True
-                    break
+            # P0-A: Never assume simulated leads were actually uploaded to a remote service
+            if campaign_id and not is_simulated:
+                for pid in campaign.prospect_ids:
+                    p = await self.state.get_prospect(pid)
+                    if p and p.status == "contacted":
+                        already_staged = True
+                        break
             if already_staged:
                 logger.info(
                     f"Sender: Leads for '{campaign.name}' already staged. Retrying activation."
@@ -246,7 +262,7 @@ class Sender:
                     await self.state.update_campaign(campaign.id, status="active")
                     logger.info(f"Sender: Campaign '{campaign.name}' activated on retry.")
                 elif act_res is not None:
-                    await self.state.update_campaign(campaign.id, status="simulated")
+                    await self.state.update_campaign(campaign.id, instantly_campaign_id="", status="simulated")
                     logger.info(f"Sender: Campaign '{campaign.name}' marked simulated (dry-run intercept).")
                 return
             logger.warning(f"Sender: No valid prospects for campaign {campaign.name}")
@@ -281,12 +297,19 @@ class Sender:
         if result is None:
             logger.error(f"Sender: Failed to add leads to campaign {campaign_id}")
             return
+        if result.get("dry_run") or result.get("simulated"):
+            is_simulated = True
 
-        # Mark prospects as contacted BEFORE activation: if activation
-        # succeeds but this write failed, a retry would re-add the same
-        # leads. Better to under-count than double-send.
-        for prospect in prospects:
-            await self.state.update_prospect_status(prospect.id, "contacted")
+        # P0-A: Only mark prospects as contacted if this was a REAL, non-simulated lead upload!
+        # Simulated operations must NEVER pollute prospect status, daily counts, or sent metrics.
+        if not is_simulated:
+            for prospect in prospects:
+                await self.state.update_prospect_status(prospect.id, "contacted")
+        else:
+            logger.info(
+                f"Sender: [SIMULATION] Staged {len(prospects)} leads in memory for '{campaign.name}'. "
+                "Prospect status preserved as uncontacted."
+            )
 
         # 4. Activate campaign
         result = await self.instantly.activate_campaign(campaign_id)
@@ -296,30 +319,53 @@ class Sender:
                 "Leads are staged; will retry activation next cycle."
             )
             return
-        is_dry_run_campaign = bool(result.get("dry_run") or result.get("status") == "blocked_dry_run")
+        is_dry_run_campaign = is_simulated or bool(
+            result.get("dry_run") or result.get("simulated") or result.get("status") == "blocked_dry_run"
+        )
 
         # 5. Update our records
         final_status = "simulated" if is_dry_run_campaign else "active"
+        # P0-A: Simulated Campaign ID must NOT be stored as a real remote Campaign ID
+        stored_campaign_id = "" if is_dry_run_campaign else campaign_id
         await self.state.update_campaign(
             campaign.id,
-            instantly_campaign_id=campaign_id,
+            instantly_campaign_id=stored_campaign_id,
             status=final_status,
         )
+        if is_dry_run_campaign:
+            campaign.instantly_campaign_id = ""
 
-        await self.state.log_action(
-            action_type="send_campaign",
-            agent="sender",
-            details={
-                "campaign_name": campaign.name,
-                "instantly_campaign_id": campaign_id,
-                "leads_added": len(leads),
-            },
-        )
-
-        logger.info(
-            f"Sender: Campaign '{campaign.name}' deployed to Instantly "
-            f"with {len(leads)} leads. Campaign ID: {campaign_id}"
-        )
+        # P0-A: Distinguish simulated runs from real external business events
+        if is_dry_run_campaign:
+            await self.state.log_action(
+                action_type="campaign_simulated",
+                agent="sender",
+                details={
+                    "campaign_name": campaign.name,
+                    "provider": "instantly",
+                    "simulated_campaign_id": campaign_id,
+                    "leads_count": len(leads),
+                    "simulated": True,
+                },
+            )
+            logger.info(
+                f"Sender: [SIMULATION] Campaign '{campaign.name}' simulated with "
+                f"{len(leads)} leads. Zero external network egress."
+            )
+        else:
+            await self.state.log_action(
+                action_type="send_campaign",
+                agent="sender",
+                details={
+                    "campaign_name": campaign.name,
+                    "instantly_campaign_id": campaign_id,
+                    "leads_added": len(leads),
+                },
+            )
+            logger.info(
+                f"Sender: Campaign '{campaign.name}' deployed to Instantly "
+                f"with {len(leads)} leads. Campaign ID: {campaign_id}"
+            )
 
     async def _count_sends_today(self) -> int:
         """Count how many prospects were contacted today."""

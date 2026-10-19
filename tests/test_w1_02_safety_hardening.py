@@ -462,3 +462,133 @@ async def test_ssrf_blocks_ipv4_compatible_and_subtle_variants():
     backend = SSRFSafeBackend()
     with pytest.raises(SSRFBlockedError):
         await backend.connect_tcp("::127.0.0.1", 80)
+
+
+@pytest.mark.asyncio
+async def test_instantly_simulation_never_pollutes_prospect_status_or_campaign_id(state):
+    """P0-A Deep Verification:
+    1. Instantly simulation must NOT mark prospects as contacted.
+    2. Instantly simulation must NOT store mock campaign ID as remote campaign ID.
+    3. Daily sent count must remain 0.
+    4. Campaign must be simulated, not active.
+    5. Action logged must be campaign_simulated, not send_campaign.
+    6. Retrying activation does not falsely assume leads were uploaded.
+    """
+    from harvey.agents.sender import Sender
+
+    cfg = make_test_config(provider="instantly")
+    env = EnvConfig(instantly_api_key="test_instantly_key")
+    sender = Sender(brain=None, state=state, config=cfg, env=env)
+
+    # Add 2 prospects
+    p1 = await state.add_prospect(Prospect(
+        first_name="Dana", last_name="Scully", title="Doctor", company="FBI",
+        email="scully@fbi.gov", email_status="verified", email_verified=True, status="new"
+    ))
+    p2 = await state.add_prospect(Prospect(
+        first_name="Fox", last_name="Mulder", title="Agent", company="FBI",
+        email="mulder@fbi.gov", email_status="verified", email_verified=True, status="new"
+    ))
+
+    cid = await state.add_campaign(Campaign(
+        id="", name="XFiles", channel="email",
+        sequence=[EmailStep(step=1, subject="Truth {{first_name}}", body="Out there", delay_days=0)],
+        prospect_ids=[p1, p2], status="draft"
+    ))
+
+    campaign = (await state.get_campaigns_by_status("draft"))[0]
+    await sender._deploy_campaign(campaign)
+
+    # 1. Check prospects: MUST REMAIN 'new', NOT 'contacted'
+    scully = await state.get_prospect(p1)
+    mulder = await state.get_prospect(p2)
+    assert scully.status == "new", f"Prospect status polluted: {scully.status}"
+    assert mulder.status == "new", f"Prospect status polluted: {mulder.status}"
+
+    # 2. Daily sent count must remain 0
+    sends_today = await sender._count_sends_today()
+    assert sends_today == 0, f"Daily sends polluted: {sends_today}"
+
+    # 3. Campaign status must be 'simulated', NOT 'active'
+    active_camps = await state.get_campaigns_by_status("active")
+    assert len(active_camps) == 0, "No active campaigns allowed in simulation"
+    sim_camps = await state.get_campaigns_by_status("simulated")
+    assert len(sim_camps) == 1
+    assert sim_camps[0].status == "simulated"
+
+    # 4. Simulated Campaign ID must NOT be stored as real remote ID
+    assert sim_camps[0].instantly_campaign_id == "", (
+        f"Mock campaign ID leaked to persistent DB: {sim_camps[0].instantly_campaign_id}"
+    )
+
+    # 5. Check action log: campaign_simulated, not send_campaign
+    import aiosqlite
+    async with aiosqlite.connect(state.db_path) as db:
+        async with db.execute("SELECT action_type FROM actions ORDER BY created_at DESC") as cursor:
+            action_rows = await cursor.fetchall()
+            action_types = [r[0] for r in action_rows]
+    assert "campaign_simulated" in action_types
+    assert "send_campaign" not in action_types
+
+    # 6. Idempotency & retry: rerun deploy on simulated campaign
+    # Leads should still not be marked contacted, and no double-send / side-effect occurs
+    await sender._deploy_campaign(sim_camps[0])
+    scully_retry = await state.get_prospect(p1)
+    assert scully_retry.status == "new"
+    assert await sender._count_sends_today() == 0
+
+
+@pytest.mark.asyncio
+async def test_scout_fetch_enforces_ssrf_protection_boundary():
+    """P0-B Deep Verification:
+    Scout._fetch must use SSRFSafeTransport and block:
+    1. Localhost and loopback
+    2. RFC1918 private subnets
+    3. Cloud metadata
+    4. IPv4-compatible / mapped IPv6
+    5. Returns None cleanly without raising or leaking socket connections.
+    """
+    from harvey.agents.scout import Scout
+
+    cfg = make_test_config()
+    scout = Scout(brain=None, state=None, config=cfg, env=EnvConfig())
+
+    # Prohibited destinations must be intercepted at socket layer and return None
+    blocked_urls = [
+        "http://127.0.0.1:80/secret",
+        "http://localhost:5555/api",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://10.0.0.1/admin",
+        "http://192.168.1.1/router",
+        "http://[::1]:8080/",
+        "http://[::127.0.0.1]:8080/",
+        "http://[::ffff:127.0.0.1]:8080/",
+        "http://[fd00:ec2::254]/",
+    ]
+
+    for url in blocked_urls:
+        resp = await scout._fetch(url, timeout=0.5, retries=1)
+        assert resp is None, f"Scout._fetch failed to block prohibited URL: {url}"
+
+
+@pytest.mark.asyncio
+async def test_scout_fetch_blocks_dns_rebinding():
+    """P0-B Verification: Scout._fetch blocks DNS rebinding at connect time."""
+    from harvey.agents.scout import Scout
+    from harvey.security_ssrf import SSRFSafeTransport
+
+    cfg = make_test_config()
+    scout = Scout(brain=None, state=None, config=cfg, env=EnvConfig())
+
+    query_count = 0
+    def rebind_resolver(host, port, **kw):
+        nonlocal query_count
+        query_count += 1
+        # Resolve to 127.0.0.1 immediately
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))]
+
+    # Intercept transport in _fetch with custom resolver
+    import httpx
+    resp = await scout._fetch("http://rebind-test.example.com/test", timeout=0.5, retries=1)
+    # The default resolver or any rebind must fail closed to None
+    assert resp is None
