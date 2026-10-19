@@ -80,3 +80,30 @@ When qualifying, gather in this order:
 4. Recent company news (free: Google search)
 5. Tech stack (free: BuiltWith, Wappalyzer)
 6. Personalization angles (free: LinkedIn posts, company blog)
+
+
+---
+
+## DevTools & FetchInbox Qualification Framework
+
+For developer tooling and test infrastructure prospects, qualify against concrete technical architecture rather than vague business size.
+
+### Technical ICP Criteria (Tier 1 vs Tier 2)
+1. **Tier 1 (High Intent / Architectural Fit)**:
+   - AI Agent teams building autonomous browser operators (`BUILDS_AI_OR_BROWSER_AGENTS`).
+   - SaaS platforms with email OTP/magic link verification AND automated E2E test suites (`HAS_SIGNUP_OTP_OR_MAGIC_LINK` + `USES_E2E_TEST_FRAMEWORK`).
+   - QA consultancies managing multi-tenant test suites (`MULTI_TENANT_QA`).
+2. **Tier 2 (Moderate Fit / Potential Need)**:
+   - Developers with public APIs and technical docs, but unverified E2E test suite volume.
+3. **Disqualified (Instant Rejection)**:
+   - Direct competitors (disposable email services, Mailosaur, Mailtrap, temporary inbox providers).
+   - Consumer eCommerce / retail with no developer or automation focus.
+   - Closed enterprise environments requiring exclusively on-premise air-gapped hardware.
+
+### Evidence Quality Ladder
+- **SUFFICIENT**: At least 2 independent verifiable facts (e.g., active QA automation job post + OTP signup flow on site).
+- **PARTIAL**: 1 factual technical indicator (e.g., OTP login detected, but test framework unknown). Status MUST remain `POTENTIAL_FIT / NEEDS_REVIEW`.
+- **INSUFFICIENT**: Only DNS SPF records or domain name without visible authentication/testing evidence.
+
+### Prohibition on Active Buyer Labeling
+A prospect MUST NOT be marked `CONFIRMED_ACTIVE_BUYER` unless concrete, fresh buying intent (e.g., active hiring for test infra, public complaints of flaky email tests, or immediate architecture migration) is verified with independent evidence.

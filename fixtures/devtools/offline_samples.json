@@ -1,0 +1,163 @@
+{
+  "saas_with_otp": {
+    "domain": "authagent.io",
+    "company_name": "AuthAgent Inc",
+    "html_login": "<!DOCTYPE html>\n<html>\n<head><title>AuthAgent - Sign in</title></head>\n<body>\n    <form action=\"/auth/send-code\" method=\"POST\">\n        <h2>Enter your email to receive a 6-digit verification code</h2>\n        <input type=\"email\" name=\"email\" placeholder=\"you@work.com\" required />\n        <button type=\"submit\">Send Verification Code</button>\n    </form>\n    <div class=\"info\">We will send a 6-digit magic code to verify your corporate identity.</div>\n</body>\n</html>",
+    "html_careers": "<!DOCTYPE html>\n<html>\n<body>\n    <h1>Join our Platform Engineering Team</h1>\n    <div class=\"job-opening\">\n        <h3>Senior QA Automation Engineer (Playwright & E2E)</h3>\n        <p>Location: Remote. Status: Open (Posted 3 days ago).</p>\n        <p>Requirements: 4+ years running end-to-end testing with Playwright, Cypress, or Selenium.\n           Experience automating authentication flows, magic links, and transactional email verification in CI/CD.</p>\n    </div>\n</body>\n</html>",
+    "html_docs": "<!DOCTYPE html>\n<html>\n<body>\n    <h1>AuthAgent Developer Docs & API Reference</h1>\n    <p>Use our REST API and webhooks to integrate automated login and workflow tasks.</p>\n    <code>POST /v1/auth/verify-token</code>\n</body>\n</html>",
+    "dns_spf": [
+      "v=spf1 include:_spf.google.com include:sendgrid.net ~all"
+    ],
+    "is_active_hiring": true,
+    "is_competitor": false,
+    "is_consumer_only": false,
+    "expected_qualification": {
+      "icp_fit": "TIER_1_STRONG_FIT",
+      "use_case_fit": "E2E_AUTH_TESTING",
+      "evidence_quality": "SUFFICIENT",
+      "has_intent": true,
+      "disqualified": false
+    }
+  },
+  "ai_browser_agent": {
+    "domain": "browserworker.ai",
+    "company_name": "BrowserWorker Technologies",
+    "html_login": "<!DOCTYPE html>\n<html>\n<body>\n    <h1>Sign in with Magic Link</h1>\n    <form>\n        <input type=\"email\" placeholder=\"name@company.com\" />\n        <button>Email me a magic link to sign in</button>\n    </form>\n</body>\n</html>",
+    "html_careers": "<!DOCTYPE html>\n<html>\n<body>\n    <div class=\"job\">\n        <h3>Agent Infrastructure Engineer (Browser Automation)</h3>\n        <p>Status: Active. Requirements: Building multi-step headless browser agents using Playwright and Puppeteer.</p>\n    </div>\n</body>\n</html>",
+    "html_docs": "<!DOCTYPE html>\n<html>\n<body>\n    <h1>BrowserWorker Autonomous Web Agent SDK</h1>\n    <p>Our agents can navigate web forms, solve multi-step onboarding, and complete complex user journeys.</p>\n    <pre>npm install @browserworker/agent-sdk</pre>\n</body>\n</html>",
+    "dns_spf": [
+      "v=spf1 include:spf.protection.outlook.com include:postmarkapp.com ~all"
+    ],
+    "is_active_hiring": true,
+    "is_competitor": false,
+    "is_consumer_only": false,
+    "expected_qualification": {
+      "icp_fit": "TIER_1_STRONG_FIT",
+      "use_case_fit": "AGENT_INBOX",
+      "evidence_quality": "SUFFICIENT",
+      "has_intent": true,
+      "disqualified": false
+    }
+  },
+  "qa_agency": {
+    "domain": "qualitest-labs.dev",
+    "company_name": "QualiTest Automation Labs",
+    "html_login": "<!DOCTYPE html>\n<html><body><form><input type=\"password\" placeholder=\"Client portal password\" /></form></body></html>",
+    "html_careers": "<!DOCTYPE html>\n<html><body>\n    <h2>Open Positions</h2>\n    <div class=\"job-card\">\n        <h4>Lead Automation Consultant (SDET)</h4>\n        <p>Active hiring. Build multi-tenant Cypress & Playwright frameworks for fintech and SaaS clients.</p>\n    </div>\n</body></html>",
+    "html_docs": "<!DOCTYPE html>\n<html><body>\n    <h1>Case Studies & Whitepapers</h1>\n    <p>How we reduced registration test suite flakes by 80% across 50 enterprise client pipelines.</p>\n</body></html>",
+    "dns_spf": [
+      "v=spf1 include:mailgun.org ~all"
+    ],
+    "is_active_hiring": true,
+    "is_competitor": false,
+    "is_consumer_only": false,
+    "expected_qualification": {
+      "icp_fit": "TIER_1_STRONG_FIT",
+      "use_case_fit": "MULTI_TENANT_QA",
+      "evidence_quality": "SUFFICIENT",
+      "has_intent": true,
+      "disqualified": false
+    }
+  },
+  "direct_competitor": {
+    "domain": "testmailtemp.io",
+    "company_name": "TestMailTemp",
+    "html_login": "<!DOCTYPE html><html><body><h1>Sign In</h1><form><input type=\"text\" /></form></body></html>",
+    "html_careers": "",
+    "html_docs": "<!DOCTYPE html><html><body><h1>API Reference</h1><p>Disposable email address and temporary mailbox API for automated testing.</p></body></html>",
+    "dns_spf": [
+      "v=spf1 include:_spf.google.com ~all"
+    ],
+    "is_active_hiring": false,
+    "is_competitor": true,
+    "is_consumer_only": false,
+    "expected_qualification": {
+      "icp_fit": "NON_ICP",
+      "use_case_fit": "NONE",
+      "evidence_quality": "INSUFFICIENT",
+      "has_intent": false,
+      "disqualified": true,
+      "disqualified_reason": "DIRECT_COMPETITOR"
+    }
+  },
+  "consumer_fashion": {
+    "domain": "cozythreads-apparel.com",
+    "company_name": "CozyThreads Apparel",
+    "html_login": "<!DOCTYPE html><html><body><h1>Customer Account</h1><form><input type=\"email\" /><input type=\"password\" /></form></body></html>",
+    "html_careers": "<!DOCTYPE html><html><body><p>We are hiring retail store associates and fashion models.</p></body></html>",
+    "html_docs": "",
+    "dns_spf": [
+      "v=spf1 include:shops.shopify.com ~all"
+    ],
+    "is_active_hiring": true,
+    "is_competitor": false,
+    "is_consumer_only": true,
+    "expected_qualification": {
+      "icp_fit": "NON_ICP",
+      "use_case_fit": "NONE",
+      "evidence_quality": "INSUFFICIENT",
+      "has_intent": false,
+      "disqualified": true,
+      "disqualified_reason": "CONSUMER_ONLY"
+    }
+  },
+  "local_dentist": {
+    "domain": "denver-smiles-clinic.com",
+    "company_name": "Denver Smiles Dental Clinic",
+    "html_login": "",
+    "html_careers": "",
+    "html_docs": "",
+    "dns_spf": [
+      "v=spf1 include:secureserver.net ~all"
+    ],
+    "is_active_hiring": false,
+    "is_competitor": false,
+    "is_consumer_only": false,
+    "expected_qualification": {
+      "icp_fit": "NON_ICP",
+      "use_case_fit": "NONE",
+      "evidence_quality": "INSUFFICIENT",
+      "has_intent": false,
+      "disqualified": true,
+      "disqualified_reason": "NO_AUTOMATION_NEED"
+    }
+  },
+  "stale_hiring_saas": {
+    "domain": "cloudledger.net",
+    "company_name": "CloudLedger Bookkeeping",
+    "html_login": "<!DOCTYPE html><html><body><form><input type=\"email\" placeholder=\"Sign in with email code\" /></form></body></html>",
+    "html_careers": "<!DOCTYPE html><html><body>\n            <h3>Careers at CloudLedger</h3>\n            <div class=\"job-archive\">\n                <span class=\"status\">CLOSED / FILLED (October 2024)</span>\n                <p>QA Automation Engineer (Cypress)</p>\n            </div>\n            <p>We are currently not hiring for any engineering positions.</p>\n        </body></html>",
+    "html_docs": "",
+    "dns_spf": [
+      "v=spf1 include:resend.com ~all"
+    ],
+    "is_active_hiring": false,
+    "is_competitor": false,
+    "is_consumer_only": false,
+    "expected_qualification": {
+      "icp_fit": "TIER_2_MODERATE_FIT",
+      "use_case_fit": "E2E_AUTH_TESTING",
+      "evidence_quality": "PARTIAL",
+      "has_intent": false,
+      "disqualified": false
+    }
+  },
+  "single_page_duplication": {
+    "domain": "agenticops.dev",
+    "company_name": "AgenticOps Tools",
+    "html_login": "<!DOCTYPE html><html><body>\n            <p>Our browser automation agents automate everything.</p>\n            <p>With Playwright support, our browser automation agents work smoothly.</p>\n            <p>Did we mention our browser automation agents use Playwright?</p>\n        </body></html>",
+    "html_careers": "",
+    "html_docs": "",
+    "dns_spf": [],
+    "is_active_hiring": false,
+    "is_competitor": false,
+    "is_consumer_only": false,
+    "expected_qualification": {
+      "icp_fit": "TIER_1_STRONG_FIT",
+      "use_case_fit": "AGENT_INBOX",
+      "evidence_quality": "PARTIAL",
+      "has_intent": false,
+      "disqualified": false
+    }
+  }
+}

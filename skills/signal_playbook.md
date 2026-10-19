@@ -86,3 +86,30 @@ faces right now — stated as an observation, not a fake personalization.
 "Most teams at your headcount still reconcile this by hand" is a true,
 useful opener.
 "I was looking at your website and love what you're doing" is not.
+
+
+## DevTools & Email Testing Signals (FetchInbox Specialization)
+
+Relevance in developer tools turns on engineering reality, not marketing copy.
+Never open with "saw you're using Playwright" or "noticed you have a login page" —
+that reads as an automated scan and gets marked as spam.
+Instead, anchor on the developer workflow friction behind the signal.
+
+### 1. Signup OTP or Magic Link (`HAS_SIGNUP_OTP_OR_MAGIC_LINK`)
+- **Angle**: Flaky CI test runs caused by email latency or shared mailbox contention.
+- **Good**: "Saw you recently added 6-digit email OTPs to your signup flow. Usually that means the QA team starts running into flaky E2E tests whenever email delivery lags in CI — how are your Playwright runs handling mailbox isolation right now?"
+- **Bad**: "I noticed you use email verification on your login page!"
+
+### 2. Browser / AI Agent Infrastructure (`BUILDS_AI_OR_BROWSER_AGENTS`)
+- **Angle**: Headless agent authentication barriers and programmatic inbox creation.
+- **Good**: "Building autonomous web agents usually hits a wall when a workflow has to sign up on a third-party site and solve an email verification step. How are your headless agents dynamically leasing clean inboxes today?"
+- **Bad**: "Congrats on building an AI agent! Buy our email API."
+
+### 3. Hiring QA / SDET / Agent Infra (`HIRING_QA_OR_AGENT_INFRA`)
+- **Angle**: Upcoming regression test suite expansion or test pipeline scaling.
+- **Good**: "Saw you're expanding your QA automation team for browser testing. When regression suites grow past a few dozen parallel jobs, managing shared test accounts and OTP extraction usually becomes a bottleneck — are you building internal test inbox plumbing or using an API?"
+- **Bad**: "Saw your job post for a QA engineer, hire our tool instead."
+
+### 4. Technical Lead vs. Purchase Intent Warning
+- SPF/DNS records mentioning SendGrid/Postmark only prove email infrastructure configuration; they do NOT prove an active purchasing need.
+- Never cite DNS or SPF records in an email hook. Keep those as silent backend context.

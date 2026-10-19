@@ -87,6 +87,8 @@ async def run_prospecting(
     max_spend: float = 1.0,
     profile: bool = True,
     profile_limit: int = 200,
+    devtools: bool = False,
+    devtools_limit: int = 50,
     dry_run: bool = False,
 ) -> PipelineReport:
     """Discover businesses, then read what their websites say about them.
@@ -124,5 +126,13 @@ async def run_prospecting(
     except Exception as e:
         logger.exception("profile stage failed")
         report.errors.append(f"profile: {e}")
+
+    # Optional DevTools enrichment stage (default: False, minimal hook)
+    if devtools:
+        try:
+            logger.info("devtools: running optional devtools evaluation hook (limit=%d)", devtools_limit)
+        except Exception as e:
+            logger.exception("devtools stage failed")
+            report.errors.append(f"devtools: {e}")
 
     return report

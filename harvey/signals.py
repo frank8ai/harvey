@@ -17,7 +17,7 @@ and provenance travel with the fact.
 # category: discovery | profile | people | verification
 # value_type: num | text | bool
 # cost_note: what collecting it actually costs, in plain language
-SIGNAL_CATALOG: list[dict] = [
+CORE_SIGNAL_CATALOG: list[dict] = [
     # ── Discovery: who exists, and how visible are they ──
     {
         "code": "SERP_RANK",
@@ -292,6 +292,121 @@ SIGNAL_CATALOG: list[dict] = [
         "confidence_floor": 0.0,
     },
 ]
+
+
+# ── DevTools & Qualification Extensions (W1-03) ──────────────────────
+DEVTOOLS_SIGNAL_CATALOG: list[dict] = [
+    # 6 Fact / Context Observations
+    {
+        "code": "HAS_SIGNUP_OTP_OR_MAGIC_LINK",
+        "label": "Signup/login uses email OTP or magic link",
+        "description": (
+            "Signup or authentication flow specifically requires an email verification code "
+            "or magic link, creating a concrete need for email inbox automation during testing."
+        ),
+        "category": "profile",
+        "value_type": "bool",
+        "collector": "devtools",
+        "cost_note": "free (login/signup HTML inspection)",
+        "confidence_floor": 0.80,
+    },
+    {
+        "code": "USES_E2E_TEST_FRAMEWORK",
+        "label": "Uses E2E test framework",
+        "description": (
+            "Company uses Playwright, Cypress, Selenium, or Puppeteer for browser automation "
+            "or end-to-end testing, indicating an automated testing infrastructure."
+        ),
+        "category": "profile",
+        "value_type": "text",
+        "collector": "devtools",
+        "cost_note": "free (public repository, blog, or job posting analysis)",
+        "confidence_floor": 0.85,
+    },
+    {
+        "code": "BUILDS_AI_OR_BROWSER_AGENTS",
+        "label": "Builds AI or browser agents",
+        "description": (
+            "Product or engineering teams build autonomous web agents, computer-use agents, "
+            "or headless workflows that require automated email verification on behalf of users."
+        ),
+        "category": "profile",
+        "value_type": "bool",
+        "collector": "devtools",
+        "cost_note": "free (product documentation and SDK analysis)",
+        "confidence_floor": 0.85,
+    },
+    {
+        "code": "HAS_DEVELOPER_DOCS_OR_API",
+        "label": "Has developer documentation or public API",
+        "description": (
+            "Company provides public developer documentation, SDKs, or an API reference, "
+            "confirming technical maturity and developer focus."
+        ),
+        "category": "profile",
+        "value_type": "bool",
+        "collector": "devtools",
+        "cost_note": "free (site navigation and docs path inspection)",
+        "confidence_floor": 0.90,
+    },
+    {
+        "code": "USES_TRANSACTIONAL_EMAIL_ESP",
+        "label": "Transactional email provider configured",
+        "description": (
+            "DNS SPF records or headers identify a dedicated transactional email provider "
+            "(Postmark, SendGrid, Resend, Mailgun, Amazon SES). Technical signal only, "
+            "does not prove active buying intent."
+        ),
+        "category": "profile",
+        "value_type": "text",
+        "collector": "devtools",
+        "cost_note": "free (DNS SPF/TXT inspection)",
+        "confidence_floor": 0.70,
+    },
+    {
+        "code": "HIRING_QA_OR_AGENT_INFRA",
+        "label": "Hiring QA or AI agent infrastructure",
+        "description": (
+            "Active, non-expired job postings for QA automation engineers, SDETs, "
+            "or AI agent platform engineers, representing immediate hiring and tooling pressure."
+        ),
+        "category": "profile",
+        "value_type": "text",
+        "collector": "devtools",
+        "cost_note": "free (careers page inspection)",
+        "confidence_floor": 0.80,
+    },
+    # 2 Derived Qualification States
+    {
+        "code": "VERISIG_EVIDENCE_SUFFICIENCY",
+        "label": "Verisig evidence sufficiency assessment",
+        "description": (
+            "Derived judgment on whether observations provide sufficient, non-conflicting "
+            "evidence across multiple independent sources (SUFFICIENT, PARTIAL, INSUFFICIENT, CONFLICTING)."
+        ),
+        "category": "verification",
+        "value_type": "text",
+        "collector": "qualification",
+        "cost_note": "free (deterministic qualification engine evaluation)",
+        "confidence_floor": 1.0,
+    },
+    {
+        "code": "VERISIG_DISQUALIFIED_REASON",
+        "label": "Verisig disqualification reason",
+        "description": (
+            "Derived disqualification status reason (e.g., DIRECT_COMPETITOR, CONSUMER_ONLY, "
+            "NO_AUTOMATION_NEED, ENTERPRISE_CUSTOM_OUT_OF_SCOPE, STALE_BUSINESS)."
+        ),
+        "category": "verification",
+        "value_type": "text",
+        "collector": "qualification",
+        "cost_note": "free (deterministic qualification engine evaluation)",
+        "confidence_floor": 1.0,
+    },
+]
+
+# Full combined catalog: preserves all 23 core signals + 8 DevTools/Qualification signals
+SIGNAL_CATALOG: list[dict] = CORE_SIGNAL_CATALOG + DEVTOOLS_SIGNAL_CATALOG
 
 
 async def seed_signal_catalog(state) -> int:
