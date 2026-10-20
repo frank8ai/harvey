@@ -36,6 +36,7 @@ class PipelineReport:
     devtools_companies: int = 0
     devtools_observations: int = 0
     devtools_run_id: str = ""
+    opportunity_cards: list = field(default_factory=list)
     skipped: str = ""
     errors: list[str] = field(default_factory=list)
 
@@ -48,6 +49,10 @@ class PipelineReport:
             "devtools_companies": self.devtools_companies,
             "devtools_observations": self.devtools_observations,
             "devtools_run_id": self.devtools_run_id,
+            "opportunity_cards": [
+                c.as_dict() if hasattr(c, "as_dict") else c
+                for c in self.opportunity_cards
+            ],
             "skipped": self.skipped,
             "errors": self.errors,
         }
@@ -155,6 +160,7 @@ async def run_prospecting(
             report.devtools_companies = devtools_res.evaluated_companies
             report.devtools_observations = devtools_res.recorded_observations
             report.devtools_run_id = devtools_res.run_id
+            report.opportunity_cards = devtools_res.opportunity_cards
             if devtools_res.errors:
                 report.errors.extend(devtools_res.errors)
             logger.info(
@@ -210,6 +216,7 @@ async def run_offline_prospecting(
             report.devtools_companies = res.evaluated_companies
             report.devtools_observations = res.recorded_observations
             report.devtools_run_id = res.run_id
+            report.opportunity_cards = res.opportunity_cards
             if res.errors:
                 report.errors.extend(res.errors)
         except Exception as e:

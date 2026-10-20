@@ -277,7 +277,12 @@ def extract_e2e_frameworks(text: str, source_url: str = "") -> list[dict[str, An
     url = source_url.strip() if source_url and source_url.strip() else "UNKNOWN"
     found = []
     for name, pattern in E2E_FRAMEWORKS.items():
-        if pattern.search(text):
+        for m in pattern.finditer(text):
+            vicinity_start = max(0, m.start() - 250)
+            vicinity_end = min(len(text), m.end() + 250)
+            vicinity = text[vicinity_start:vicinity_end]
+            if any(closed_pat.search(vicinity) for closed_pat in CLOSED_JOB_MARKERS):
+                continue
             found.append({
                 "signal_code": "USES_E2E_TEST_FRAMEWORK",
                 "framework": name,
@@ -286,6 +291,7 @@ def extract_e2e_frameworks(text: str, source_url: str = "") -> list[dict[str, An
                 "confidence": 0.85,
                 "snippet_hash": _content_fingerprint(name),
             })
+            break
     return found
 
 
@@ -718,8 +724,18 @@ def evaluate_devtools_prospect(
         ("docs", url_docs, html_docs),
     ]
 
+    # Only pages that contributed extracted factual signals are counted toward independent sources (Review finding #5)
+    extracted_source_urls = {
+        s.get("source_url", "") for s in extracted
+        if s.get("source_url") and s.get("source_url") != "UNKNOWN"
+    }
+
     for page_name, p_url, p_html in raw_pages:
         if not p_html or not p_html.strip():
+            continue
+        p_url_clean = p_url.strip() if p_url else ""
+        if p_url_clean and p_url_clean not in extracted_source_urls:
+            # Page contributed no extracted fact signals; do not count toward independent sources
             continue
         chash = _content_fingerprint(p_html)
         if chash in seen_content_hashes:
@@ -942,16 +958,23 @@ async def record_devtools_observations(
     if not observations:
         return 0
 
-    # Update company signals in memory / state
+    # Update company signals in memory / state (P1-B: strictly filtered through confirmation gate)
     try:
-        await state.update_company_signals(
-            company_id,
-            tech_stack=[s["evidence"] for s in qualification.extracted_signals if s.get("signal_code") == "USES_E2E_TEST_FRAMEWORK"],
-            new_signals=[
-                {"type": s["signal_code"], "detail": s.get("evidence", "")}
-                for s in qualification.extracted_signals
-            ],
-        )
+        confirmed_tech = [
+            s["evidence"] for s in qualification.extracted_signals
+            if s.get("signal_code") == "USES_E2E_TEST_FRAMEWORK" and "USES_E2E_TEST_FRAMEWORK" in confirmed
+        ]
+        confirmed_signals = [
+            {"type": s["signal_code"], "detail": s.get("evidence", "")}
+            for s in qualification.extracted_signals
+            if s.get("signal_code") in confirmed
+        ]
+        if confirmed_tech or confirmed_signals:
+            await state.update_company_signals(
+                company_id,
+                tech_stack=confirmed_tech,
+                new_signals=confirmed_signals,
+            )
     except Exception as e:
         logger.debug("update_company_signals non-critical warning for %s: %s", company_id, e)
 

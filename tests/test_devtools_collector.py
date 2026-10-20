@@ -476,3 +476,183 @@ def test_p1_invalid_purchase_evidence_rejected_never_confirmed_buyer():
     assert res_valid.qualification_status == "PURCHASE_CANDIDATE_PENDING_VERIFICATION"
     assert res_valid.qualification_status != "CONFIRMED_ACTIVE_BUYER"
     assert res_valid.next_best_research_action == "HUMAN_PROCUREMENT_VERIFICATION"
+
+# ── Review Closure Tests (P1-A, P1-B, Thread #3, Thread #5) ──────────
+
+@pytest.mark.asyncio
+async def test_p1_a_writer_skips_disqualified_companies(tmp_path):
+    """P1-A: Prospects belonging to DISQUALIFIED companies must be excluded from Writer."""
+    from harvey.agents.writer import Writer
+    from harvey.config import load_config
+    from harvey.models import Company, Prospect
+
+    from harvey.signals import seed_signal_catalog
+    db_file = tmp_path / "writer_disq.db"
+    state = StateManager(str(db_file))
+    await state.init_db()
+    await seed_signal_catalog(state)
+
+    cfg = load_config()
+
+    # 1. Add a competitor company and a regular company
+    comp_id = await state.add_company(Company(name="Competitor Inc", domain="competitor.com"))
+    good_id = await state.add_company(Company(name="Good SaaS", domain="goodsaas.io"))
+
+    # 2. Add deliverable prospects for both
+    p_disq_id = await state.add_prospect(Prospect(
+        first_name="Alice", last_name="Bad", email="alice@competitor.com",
+        company="Competitor Inc", company_id=comp_id, email_status="verified", email_verified=True, status="new"
+    ))
+    p_good_id = await state.add_prospect(Prospect(
+        first_name="Bob", last_name="Good", email="bob@goodsaas.io",
+        company="Good SaaS", company_id=good_id, email_status="verified", email_verified=True, status="new"
+    ))
+
+    # 3. Add disqualification observation for competitor
+    await state.add_observation(
+        "VERISIG_DISQUALIFIED_REASON",
+        company_id=comp_id,
+        value_text="DIRECT_COMPETITOR",
+        confidence=1.0,
+        evidence_url="test://disq",
+    )
+
+    # Check state method
+    disq_ids = await state.get_disqualified_company_ids()
+    assert comp_id in disq_ids
+    assert good_id not in disq_ids
+
+    # 4. Mock brain provider for writer to prevent actual LLM call
+    class DummyBrain:
+        def load_skills_for_agent(self, agent_name):
+            return []
+        def load_prompt(self, prompt_name, **kwargs):
+            return "Prompt template"
+        async def think(self, prompt, **kwargs):
+            return "Subject: Hello\n\nBody text."
+        async def think_json(self, prompt, **kwargs):
+            if kwargs.get("task") == "personal_email":
+                return {"subject": "quick question", "body": "Hello Bob"}
+            return [
+                {"step": 1, "subject": "hi {{first_name}}", "body": "Hello {{company}}", "delay_days": 0},
+                {"step": 2, "subject": "follow {{first_name}}", "body": "Checking {{company}}", "delay_days": 3},
+                {"step": 3, "subject": "bye {{first_name}}", "body": "Farewell {{company}}", "delay_days": 4}
+            ]
+    writer = Writer(brain=DummyBrain(), state=state, config=cfg)
+    await writer.run()
+
+    # 5. Outbox check: Bob gets drafts, Alice does NOT get drafts
+    outbox = await state.get_outbox()
+    recipients = {item["to_email"] for item in outbox}
+    assert "bob@goodsaas.io" in recipients
+    assert "alice@competitor.com" not in recipients
+
+    # 6. Revocation check: add revocation observation (value_num=0)
+    await state.add_observation(
+        "VERISIG_DISQUALIFIED_REASON",
+        company_id=comp_id,
+        value_text="DIRECT_COMPETITOR",
+        value_num=0.0,
+        confidence=1.0,
+        evidence_url="test://revoke",
+    )
+    disq_ids_revoked = await state.get_disqualified_company_ids()
+    assert comp_id not in disq_ids_revoked
+
+
+@pytest.mark.asyncio
+async def test_p1_b_unconfirmed_signals_do_not_enter_company_profile(tmp_path):
+    """P1-B: PROPOSED / REJECTED signals must NOT be written to company.signals_json or tech_stack_json."""
+    from harvey.models import Company
+    from harvey.signals import seed_signal_catalog
+    from harvey.collectors.devtools import record_devtools_observations, DevToolsQualificationResult
+
+    db_file = tmp_path / "confirm_gate.db"
+    state = StateManager(str(db_file))
+    await state.init_db()
+    await seed_signal_catalog(state)
+
+    # Signal catalog seeds all signals as 'proposed' by default
+    comp_id = await state.add_company(Company(name="SaaS Gate", domain="saasgate.io"))
+
+    qual = DevToolsQualificationResult(
+        company_id=comp_id,
+        domain="saasgate.io",
+        evidence_quality="SUFFICIENT",
+        extracted_signals=[
+            {
+                "signal_code": "USES_E2E_TEST_FRAMEWORK",
+                "evidence": "Playwright",
+                "confidence": 0.85,
+                "source_url": "https://saasgate.io/careers",
+            },
+            {
+                "signal_code": "BUILDS_AI_OR_BROWSER_AGENTS",
+                "evidence": "computer-use agent",
+                "confidence": 0.85,
+                "source_url": "https://saasgate.io/docs",
+            },
+        ],
+    )
+
+    # 1. With proposed signals, record_devtools_observations should filter them out
+    obs_count = await record_devtools_observations(state, comp_id, qual)
+    # Observations table records them, but company.signals and tech_stack remain empty!
+    comp = await state.get_company(comp_id)
+    assert "Playwright" not in comp.tech_stack
+    assert len(comp.signals) == 0
+
+    # 2. Confirm USES_E2E_TEST_FRAMEWORK only
+    await state.set_signal_status("USES_E2E_TEST_FRAMEWORK", "confirmed")
+    await record_devtools_observations(state, comp_id, qual)
+    comp_confirmed = await state.get_company(comp_id)
+    assert "Playwright" in comp_confirmed.tech_stack
+    # BUILDS_AI_OR_BROWSER_AGENTS is still proposed, so it must NOT be in comp_confirmed.signals
+    sig_types = [s.get("type") for s in comp_confirmed.signals]
+    assert "USES_E2E_TEST_FRAMEWORK" in sig_types
+    assert "BUILDS_AI_OR_BROWSER_AGENTS" not in sig_types
+
+
+def test_review_thread_5_source_without_extracted_facts_does_not_inflate_sufficiency():
+    """Review Thread #5: An OTP match on login + a careers page with NO extracted facts
+    must NOT inflate evidence quality to SUFFICIENT.
+    """
+    res = evaluate_devtools_prospect(
+        domain="factless-careers.io",
+        company_name="Factless Careers SaaS",
+        html_login="<form><p>Enter your 6-digit verification code</p></form>",
+        url_login="https://factless-careers.io/login",
+        html_careers="<h2>Careers</h2><p>We are a great place to work with free snacks and coffee!</p>",
+        url_careers="https://factless-careers.io/careers",
+        source_type="offline_fixture",
+    )
+    # Login contributed HAS_SIGNUP_OTP_OR_MAGIC_LINK.
+    # Careers contributed NO extracted technical facts.
+    assert len(res.extracted_signals) == 1
+    assert res.extracted_signals[0]["signal_code"] == "HAS_SIGNUP_OTP_OR_MAGIC_LINK"
+    # Independent source count should be 1 (only login), not 2
+    assert res.independent_source_count == 1
+    # Evidence quality must be PARTIAL, NOT SUFFICIENT
+    assert res.evidence_quality == "PARTIAL"
+
+
+@pytest.mark.asyncio
+async def test_review_thread_3_pipeline_report_preserves_opportunity_cards(tmp_path, offline_fixtures):
+    """Review Thread #3: PipelineReport must preserve opportunity_cards."""
+    from harvey.pipeline import run_offline_prospecting
+    db_file = tmp_path / "cards_preserve.db"
+    state = StateManager(str(db_file))
+    await state.init_db()
+
+    bundle = {
+        "authagent.io": offline_fixtures["saas_with_otp"],
+    }
+    report = await run_offline_prospecting(state, evidence_bundle=bundle)
+    assert len(report.opportunity_cards) == 1
+    card = report.opportunity_cards[0]
+    assert card.domain == "authagent.io"
+    assert card.qualification_status == "POTENTIAL_FIT"
+    report_dict = report.as_dict()
+    assert "opportunity_cards" in report_dict
+    assert len(report_dict["opportunity_cards"]) == 1
+    assert report_dict["opportunity_cards"][0]["domain"] == "authagent.io"
