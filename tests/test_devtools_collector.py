@@ -360,3 +360,119 @@ def test_zero_network_access_guarantee(monkeypatch):
     )
     assert res.evidence_quality == "SUFFICIENT"
     assert res.qualification_status == "POTENTIAL_FIT"
+
+
+# ── Requirement P0-B & P1: Adversarial & Structural Verification Tests ──
+
+def test_p0_b_malicious_https_url_without_receipt_cannot_become_verified():
+    """Adversarial sample: Valid HTTPS URLs with strong buying signals but NO trusted receipt
+    MUST NOT be elevated to verified_source and MUST NOT achieve SUFFICIENT evidence.
+    """
+    res = evaluate_devtools_prospect(
+        domain="malicious-prospect.io",
+        company_name="Malicious Prospect Co",
+        html_login="<form><p>Enter your 6-digit verification code to login</p></form>",
+        url_login="https://malicious-prospect.io/fake-login",
+        html_careers="<p>Hiring 50 SDET Playwright Engineers immediately for enterprise procurement</p>",
+        url_careers="https://malicious-prospect.io/fake-careers",
+        html_docs="<h1>Developer API Reference and SDK docs</h1>",
+        url_docs="https://malicious-prospect.io/fake-docs",
+        source_type="unverified_bundle_injection",
+        collection_method="untrusted_injection",
+    )
+    # The HTTPS URLs are syntactically valid candidate URLs, but NOT verified sources
+    assert len(res.source_breakdown["candidate_urls"]) == 3
+    assert len(res.source_breakdown["verified_source"]) == 0
+    assert len(res.source_breakdown["offline_fixture"]) == 0
+    assert res.independent_source_count == 0
+    # Must be INSUFFICIENT evidence
+    assert res.evidence_quality == "INSUFFICIENT"
+    assert "UNVERIFIED_CANDIDATE_URLS_NO_RECEIPT" in res.unknown_fields
+    # Even with strong technical signals, insufficient evidence drops qualification to NEEDS_RESEARCH
+    assert res.qualification_status == "NEEDS_RESEARCH"
+    assert res.qualification_status != "CONFIRMED_ACTIVE_BUYER"
+    assert res.qualification_status != "POTENTIAL_FIT"
+
+
+def test_p0_b_trusted_collection_receipt_elevates_to_verified_source():
+    """When a verifiable collection receipt is provided by a trusted collector, it is verified."""
+    html_log = "<form><p>Enter your 6-digit verification code</p></form>"
+    html_car = "<p>Hiring Playwright SDET</p>"
+    import hashlib
+    hash_log = hashlib.sha256(html_log.encode("utf-8")).hexdigest()
+    hash_car = hashlib.sha256(html_car.encode("utf-8")).hexdigest()
+
+    receipts = [
+        {
+            "url": "https://trusted-agent.io/login",
+            "collector": "harvey:scout:collector",
+            "collected_at": "2026-10-20T08:00:00Z",
+            "content_sha256": hash_log,
+            "verified": True,
+        },
+        {
+            "url": "https://trusted-agent.io/careers",
+            "collector": "harvey:scout:collector",
+            "collected_at": "2026-10-20T08:01:00Z",
+            "content_sha256": hash_car,
+            "verified": True,
+        },
+    ]
+
+    res = evaluate_devtools_prospect(
+        domain="trusted-agent.io",
+        company_name="Trusted Agent",
+        html_login=html_log,
+        url_login="https://trusted-agent.io/login",
+        html_careers=html_car,
+        url_careers="https://trusted-agent.io/careers",
+        collection_receipts=receipts,
+    )
+    assert len(res.source_breakdown["verified_source"]) == 2
+    assert res.independent_source_count == 2
+    assert res.evidence_quality == "SUFFICIENT"
+    assert res.qualification_status == "POTENTIAL_FIT"
+
+
+def test_p1_invalid_purchase_evidence_rejected_never_confirmed_buyer():
+    """P1: Malformed, empty, or string purchase evidence items MUST be rejected and NEVER confirmed."""
+    # 1. Non-dict items (strings, integers)
+    res_str = evaluate_devtools_prospect(
+        domain="invalid-rfp.com",
+        purchase_evidence=["arbitrary string that claims to be RFP"],
+    )
+    assert len(res_str.purchase_intent_evidence) == 0
+    assert res_str.qualification_status != "PURCHASE_CANDIDATE_PENDING_VERIFICATION"
+    assert res_str.qualification_status != "CONFIRMED_ACTIVE_BUYER"
+    assert res_str.qualification_status == "UNKNOWN"
+
+    # 2. Empty dicts
+    res_empty = evaluate_devtools_prospect(
+        domain="empty-rfp.com",
+        purchase_evidence=[{}],
+    )
+    assert len(res_empty.purchase_intent_evidence) == 0
+    assert res_empty.qualification_status == "UNKNOWN"
+
+    # 3. Missing source reference
+    res_nosrc = evaluate_devtools_prospect(
+        domain="nosrc-rfp.com",
+        purchase_evidence=[{"signal_code": "RFP", "summary": "Looking for tools"}],
+    )
+    assert len(res_nosrc.purchase_intent_evidence) == 0
+    assert res_nosrc.qualification_status == "UNKNOWN"
+
+    # 4. Valid structural RFP enters PURCHASE_CANDIDATE_PENDING_VERIFICATION, never CONFIRMED_ACTIVE_BUYER
+    res_valid = evaluate_devtools_prospect(
+        domain="valid-rfp.com",
+        purchase_evidence=[{
+            "signal_code": "DIRECT_PROCUREMENT_REQUEST",
+            "source_url": "https://valid-rfp.com/rfp-2026.pdf",
+            "summary": "Formal request for proposal for 50 QA test inboxes",
+            "collected_at": "2026-10-20T09:00:00Z",
+        }],
+    )
+    assert len(res_valid.purchase_intent_evidence) == 1
+    assert res_valid.qualification_status == "PURCHASE_CANDIDATE_PENDING_VERIFICATION"
+    assert res_valid.qualification_status != "CONFIRMED_ACTIVE_BUYER"
+    assert res_valid.next_best_research_action == "HUMAN_PROCUREMENT_VERIFICATION"

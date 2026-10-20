@@ -146,3 +146,71 @@ run_prospecting(state, config, devtools=True, devtools_evidence=bundle)
 - **DevTools 核心与信号测试**：`tests/test_devtools_collector.py`、`tests/test_devtools_signals.py` 全部通过。
 - **离线端到端测试**：`tests/test_devtools_pipeline_e2e.py` 3 项测试全部通过，外层拦截断言 outbound requests = 0。
 - **Harvey 全量回归**：`403 passed, 169 skipped, 0 failed`（耗时 108.58s）。
+
+
+---
+
+## 七、W1-04-F1 最终证据契约修正与合并门禁报告 (Final Verification & Contract Hardening)
+
+> **审计执行角色**：Principal Python Architect + Evidence Integrity Engineer + Independent Integration Reviewer
+> **目标仓库**：`frank8ai/harvey`
+> **目标 PR**：PR #2 (`https://github.com/frank8ai/harvey/pull/2`)
+
+### 1. 三大缺陷最终修复证据与契约
+
+#### A. P0-A：空证据包隔离与显式数据库评估模式
+- **问题与根因**：原有 `DevToolsPipelineAdapter` 使用 `self.evidence_bundle = evidence_bundle or {}`，当调用方显式传入空字典 `{}` 时，仍隐式回退扫描 SQLite companies 全表。
+- **修复方案**：
+  - 显式区分 `None`（未提供证据包，且 `evaluate_existing_companies=True` 时允许显式评估数据库）、`{}`（显式空证据包，评估 0 家企业，不扫描历史数据库）、以及非空字典输入。
+  - `run_offline_prospecting(..., evidence_bundle={})` 评估 0 家企业，0 条 observations，历史 prospect 与 companies 完全隔离无污染。
+- **源码对应**：`harvey/collectors/devtools.py` 与 `harvey/pipeline.py`。
+
+#### B. P0-B：URL 格式合法分离与可信采集回执门禁
+- **问题与根因**：原有逻辑直接将以 `http://` 或 `https://` 开头的字符串纳入 `verified_sources`，导致虚构 HTTPS URL 伪造充分证据。
+- **修复方案**：
+  - URL 合法仅能证明其为 `candidate_urls`，不能直接标记为已验证证据。
+  - 引入可信采集回执 (`collection_receipts`) 机制：仅当回执包含可信采集器（如 `harvey:scout:collector`）、真实采集时间、与页面内容哈希一致且 `verified=True` 时，才允许纳入 `verified_sources`。
+  - 离线样本明确标记 `OFFLINE_FIXTURE` / `SYNTHETIC`，不冒充真实公网观察。
+  - 恶意样本测试证明：包含虚构 HTTPS URL 及强购买信号的恶意样本无法提升为 verified evidence，结果定级为 `INSUFFICIENT` 与 `NEEDS_RESEARCH`。
+- **源码对应**：`harvey/collectors/devtools.py`。
+
+#### C. P1：采购凭证最小结构校验与资格硬门禁
+- **问题与根因**：原有 `if purchase_evidence:` 接受任意非空列表，空字典或随意字符串均被视为有效 RFP。
+- **修复方案**：
+  - 定义并实现 `validate_purchase_evidence_item()`：严格要求字典格式、非空 `signal_code`/`type`、有效 `source_url`（非 UNKNOWN）、非空摘要以及采集时间。
+  - 任意字符串、空字典或缺失来源的凭证均被彻底拦截并记录至 `unknown_fields`。
+  - 合法采购凭证最多进入 `PURCHASE_CANDIDATE_PENDING_VERIFICATION`，绝不自动晋升为 `CONFIRMED_ACTIVE_BUYER` 或 `READY_FOR_OUTREACH`。
+- **源码对应**：`harvey/collectors/devtools.py`。
+
+#### D. Codex Automated Review 建议修复
+- **Hiring 闭门标记局部化**：将 `CLOSED_JOB_MARKERS` 检测范围限制在职位命中点前后 250 字符领域，避免单个已关闭职位误杀全页招聘信号。
+- **独立 DevTools 触发**：在 `profile=False, devtools=True` 时独立执行 DevTools 阶段，不再因 profiling 跳过而静默丢弃。
+- **源码对应**：`harvey/collectors/devtools.py`、`harvey/pipeline.py`。
+
+---
+
+### 2. 测试验证与回归矩阵
+
+- **DevTools 单元与反例套件**：`tests/test_devtools_collector.py` (16 passed)
+  - 恶意 HTTPS URL 伪造反例：`PASS` (标记 `UNVERIFIED_CANDIDATE_URLS_NO_RECEIPT`, `INSUFFICIENT`)
+  - 可信采集回执正常提升：`PASS` (`verified_source`, `SUFFICIENT`)
+  - 采购凭证非法结构拦截反例（字符串、空字典、缺来源）：`PASS` (`REJECTED_INVALID_PURCHASE_EVIDENCE`)
+  - 合法 RFP 人工核验候选门禁：`PASS` (`PURCHASE_CANDIDATE_PENDING_VERIFICATION`)
+- **端到端流水线套件**：`tests/test_devtools_pipeline_e2e.py` (6 passed)
+  - P0-A 空字典输入评估 0 家企业、不扫描 SQLite：`PASS`
+  - P0-A None 显式评估现有企业：`PASS`
+  - DevTools 在 profile=False 时独立运行：`PASS`
+  - 最外层网络拦截器捕获 outbound requests = 0：`PASS`
+- **全量 DevTools 信号套件**：`tests/test_devtools_signals.py` (3 passed)
+- **DevTools 总测试量**：25 项全部通过（100% 绿色）。
+
+---
+
+### 3. 合并门禁独立裁决 (Gate Verdict)
+
+```
+MERGE_READY = PASS
+OFFLINE_SELF_USE_READY = PASS
+CONTROLLED_DISCOVERY_READY = HOLD
+LIVE_OUTREACH_READY = FORBIDDEN
+```

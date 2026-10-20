@@ -139,6 +139,8 @@ async def test_run_prospecting_offline_evidence_only_flag(tmp_path, offline_fixt
     state = StateManager(str(db_file))
     await state.init_db()
     await seed_signal_catalog(state)
+    for sig in SIGNAL_CATALOG:
+        await state.set_signal_status(sig["code"], "confirmed")
 
     bundle = {
         "authagent.io": offline_fixtures["saas_with_otp"],
@@ -175,3 +177,92 @@ async def test_empty_offline_bundle_returns_clear_state_without_network():
     assert res.qualification_status == "UNKNOWN"
     assert res.evidence_quality == "INSUFFICIENT"
     assert "html_login" in res.unknown_fields
+
+
+@pytest.mark.asyncio
+async def test_p0_a_empty_bundle_evaluates_zero_companies_and_does_not_scan_db(tmp_path):
+    """P0-A: When offline_evidence_only=True and evidence_bundle={},
+    it must evaluate 0 companies and MUST NOT scan existing SQLite companies.
+    """
+    db_file = tmp_path / "empty_bundle_no_scan.db"
+    state = StateManager(str(db_file))
+    await state.init_db()
+    await seed_signal_catalog(state)
+
+    # Pre-populate historical companies in SQLite
+    for i in range(5):
+        await state.add_company(Company(name=f"Historical Co {i}", domain=f"hist-{i}.com"))
+
+    # Explicit empty dict bundle
+    tracker = OutboundCallTracker()
+    with offline_network_guard(tracker):
+        report = await run_offline_prospecting(
+            state=state,
+            evidence_bundle={},
+            limit=20,
+        )
+
+    assert tracker.call_count == 0
+    assert report.devtools_companies == 0
+    assert report.devtools_observations == 0
+
+    # Ensure historical companies remain untouched
+    obs = await state.get_observations()
+    assert len(obs) == 0
+
+
+@pytest.mark.asyncio
+async def test_p0_a_none_bundle_explicitly_evaluates_existing_db_companies(tmp_path):
+    """P0-A: When evidence_bundle is None, explicit evaluation of existing DB companies is allowed."""
+    db_file = tmp_path / "none_bundle_db_eval.db"
+    state = StateManager(str(db_file))
+    await state.init_db()
+    await seed_signal_catalog(state)
+
+    for i in range(3):
+        await state.add_company(Company(name=f"Existing Co {i}", domain=f"exist-{i}.com"))
+
+    tracker = OutboundCallTracker()
+    with offline_network_guard(tracker):
+        report = await run_offline_prospecting(
+            state=state,
+            evidence_bundle=None,
+            limit=10,
+        )
+
+    assert tracker.call_count == 0
+    assert report.devtools_companies == 3
+
+
+@pytest.mark.asyncio
+async def test_devtools_runs_when_profile_is_false(tmp_path, offline_fixtures):
+    """Review finding: Caller specifies devtools=True and profile=False.
+    DevTools stage must still execute without being skipped by profile=False.
+    """
+    db_file = tmp_path / "devtools_profile_false.db"
+    state = StateManager(str(db_file))
+    await state.init_db()
+    await seed_signal_catalog(state)
+    for sig in SIGNAL_CATALOG:
+        await state.set_signal_status(sig["code"], "confirmed")
+
+    bundle = {
+        "authagent.io": offline_fixtures["saas_with_otp"],
+    }
+
+    from harvey.config import load_config
+    cfg = load_config()
+
+    report = await run_prospecting(
+        state=state,
+        config=cfg,
+        queries=[],
+        profile=False,
+        devtools=True,
+        devtools_evidence=bundle,
+        dry_run=False,
+    )
+
+    assert report.profiled_companies == 0
+    assert report.devtools_companies == 1
+    assert report.devtools_observations >= 2

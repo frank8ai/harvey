@@ -126,21 +126,25 @@ async def run_prospecting(
     if dry_run:
         report.skipped = "dry run"
         return report
-    if not profile:
+
+    if not profile and not devtools:
         report.skipped = "profiling skipped"
         return report
 
-    # Profile runs even when discovery found nothing new: a previous run may
-    # have been interrupted, and observations go stale on a schedule.
-    try:
-        companies, observations, run_id = await run_profile_stage(
-            state, limit=profile_limit)
-        report.profiled_companies = companies
-        report.profile_observations = observations
-        report.profile_run_id = run_id
-    except Exception as e:
-        logger.exception("profile stage failed")
-        report.errors.append(f"profile: {e}")
+    # Profiling stage: run only if profile=True
+    if profile:
+        try:
+            companies, observations, run_id = await run_profile_stage(
+                state, limit=profile_limit)
+            report.profiled_companies = companies
+            report.profile_observations = observations
+            report.profile_run_id = run_id
+        except Exception as e:
+            logger.exception("profile stage failed")
+            report.errors.append(f"profile: {e}")
+    else:
+        report.skipped = "profiling skipped"
+        logger.info("profiling skipped by profile=False")
 
     # Optional DevTools enrichment stage (default: False, offline pipeline adapter)
     if devtools:
@@ -190,13 +194,18 @@ async def run_offline_prospecting(
     report.discover = {"found": 0, "queries": 0, "new_companies": 0, "actual_cost": 0.0, "mode": "offline_evidence_only"}
     report.skipped = "discovery and profiling bypassed in offline evidence-only mode"
 
-    if evidence_bundle is None:
-        evidence_bundle = {}
-
     tracker = OutboundCallTracker()
     with offline_network_guard(tracker):
         try:
-            adapter = DevToolsPipelineAdapter(state, evidence_bundle=evidence_bundle)
+            # P0-A: None => evaluate_existing_companies=True (explicit evaluation of SQLite companies)
+            # {} => evaluate_existing_companies=False (evaluates 0 companies, no DB fallback)
+            # dict with data => evaluates injected companies
+            eval_existing = (evidence_bundle is None)
+            adapter = DevToolsPipelineAdapter(
+                state,
+                evidence_bundle=evidence_bundle,
+                evaluate_existing_companies=eval_existing,
+            )
             res = await adapter.run(limit=limit)
             report.devtools_companies = res.evaluated_companies
             report.devtools_observations = res.recorded_observations
