@@ -172,10 +172,19 @@ class ProfileCollector:
     even if the data is sitting right there in the HTML.
     """
 
-    def __init__(self, state, confirmed: set[str] | None = None, timeout: float = 12.0):
+    def __init__(
+        self,
+        state,
+        confirmed: set[str] | None = None,
+        timeout: float = 12.0,
+        gateway=None,
+        company_id: str | None = None,
+    ):
         self.state = state
         self.confirmed = confirmed if confirmed is not None else set()
         self.timeout = timeout
+        self.gateway = gateway
+        self._current_company_id = company_id
         self._client: httpx.AsyncClient | None = None
 
     def wants(self, code: str) -> bool:
@@ -196,6 +205,23 @@ class ProfileCollector:
             await self._client.aclose()
 
     async def _get(self, url: str) -> str:
+        if self.gateway:
+            try:
+                resp_obj = await self.gateway.request(
+                    url=url,
+                    company_id=self._current_company_id,
+                    collector_id="harvey.collectors.profile",
+                )
+                if resp_obj.status_code != 200:
+                    return ""
+                ctype = resp_obj.headers.get("content-type", "")
+                if "html" not in ctype and "xml" not in ctype and "text" not in ctype:
+                    return ""
+                return resp_obj.content.decode("utf-8", errors="replace")
+            except Exception as e:
+                logger.debug(f"gateway fetch failed {url}: {e}")
+                return ""
+
         try:
             resp = await self._client.get(url)
         except (httpx.HTTPError, ValueError) as e:
@@ -344,6 +370,7 @@ class ProfileCollector:
 
     async def profile_company(self, company_id: str, domain: str) -> list[dict]:
         """Collect every confirmed profile signal for one business."""
+        self._current_company_id = company_id
         obs: list[dict] = []
         domain = domain.lower().replace("www.", "").strip("/")
 
@@ -491,7 +518,7 @@ class ProfileCollector:
         return total
 
 
-async def profile_companies(state, companies: list[dict]) -> tuple[int, str]:
+async def profile_companies(state, companies: list[dict], gateway=None) -> tuple[int, str]:
     """Convenience entry point: opens a run, profiles, closes the run."""
     from harvey.signals import seed_signal_catalog
     await seed_signal_catalog(state)
@@ -502,9 +529,9 @@ async def profile_companies(state, companies: list[dict]) -> tuple[int, str]:
             "(nothing is collected until you choose what matters)."
         )
         return 0, ""
-    run_id = await state.start_run("profile", provider="http")
+    run_id = await state.start_run("profile", provider="controlled_gateway" if gateway else "http")
     try:
-        async with ProfileCollector(state, confirmed) as collector:
+        async with ProfileCollector(state, confirmed, gateway=gateway) as collector:
             n = await collector.run(companies, run_id=run_id)
         await state.finish_run(run_id, records=n, cost_usd=0.0)
         return n, run_id
