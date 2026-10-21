@@ -1,6 +1,7 @@
 """Controlled Discovery module for Harvey.
 Provides policy engine, allowlist checking, robots.txt gating,
-and fail-closed source verification for experimental prospecting.
+egress limiter, hard budget ledger, audit logging, receipts,
+and unified fail-closed outbound security gateway.
 """
 
 from harvey.controlled_discovery.policy import (
@@ -16,6 +17,36 @@ from harvey.controlled_discovery.policy import (
     SourceStatus,
     TargetAllowlist,
 )
+from harvey.controlled_discovery.limiter import (
+    EgressLimiter,
+    EgressPermit,
+    DomainPacingState,
+    ResponseBodyMeter,
+    MeteredStream,
+)
+from harvey.controlled_discovery.budget_ledger import (
+    HardBudgetLedger,
+    ReservationRequest,
+    SettlementReport,
+    BudgetBalance,
+    ExecutionStatus,
+    BudgetExhaustedError,
+    BudgetAlreadySettledError,
+    PricingSchedule,)
+from harvey.controlled_discovery.audit import (
+    AuditLogger,
+    OutboundAuditEvent,
+)
+from harvey.controlled_discovery.receipt import (
+    TrustedCollectionReceipt,
+    ReceiptSigner,
+    ReceiptVerifier,
+)
+from harvey.controlled_discovery.gateway import (
+    ControlledEgressGateway,
+    EgressResponse,
+    EgressSecurityError,
+)
 
 __all__ = [
     "AccessPurpose",
@@ -29,4 +60,25 @@ __all__ = [
     "SourcePolicyEngine",
     "SourceStatus",
     "TargetAllowlist",
+    "EgressLimiter",
+    "EgressPermit",
+    "DomainPacingState",
+    "ResponseBodyMeter",
+    "MeteredStream",
+    "HardBudgetLedger",
+    "ReservationRequest",
+    "SettlementReport",
+    "BudgetBalance",
+    "ExecutionStatus",
+    "BudgetExhaustedError",
+    "BudgetAlreadySettledError",
+    "PricingSchedule",
+    "AuditLogger",
+    "OutboundAuditEvent",
+    "TrustedCollectionReceipt",
+    "ReceiptSigner",
+    "ReceiptVerifier",
+    "ControlledEgressGateway",
+    "EgressResponse",
+    "EgressSecurityError",
 ]
