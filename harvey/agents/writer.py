@@ -71,8 +71,24 @@ class Writer:
             )
             return
 
+        # P1-A: Exclude prospects belonging to DISQUALIFIED companies
+        disqualified_company_ids = await self.state.get_disqualified_company_ids()
+        eligible_prospects = [
+            p for p in prospects_with_email
+            if p.company_id not in disqualified_company_ids
+        ]
+        skipped_count = len(prospects_with_email) - len(eligible_prospects)
+        if skipped_count:
+            logger.info(
+                "Writer: Skipped %d deliverable prospect(s) from disqualified companies.",
+                skipped_count,
+            )
+        if not eligible_prospects:
+            logger.info("Writer: No eligible prospects after disqualification filter.")
+            return
+
         # Batch prospects into campaign groups (by industry/title for relevance)
-        batches = self._group_prospects(prospects_with_email)
+        batches = self._group_prospects(eligible_prospects)
 
         for batch_name, prospects in batches.items():
             if not prospects:

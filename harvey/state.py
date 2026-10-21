@@ -1243,6 +1243,33 @@ class StateManager:
                 row = await cursor.fetchone()
                 return row[0] if row else 0
 
+    async def get_disqualified_company_ids(self) -> set[str]:
+        """Return company IDs with active VERISIG_DISQUALIFIED_REASON observation.
+
+        A company is disqualified if its latest VERISIG_DISQUALIFIED_REASON observation
+        has non-empty value_text and value_num is NULL or != 0.
+        Recording value_num=0 or empty value_text revokes disqualification.
+        """
+        async with self._connect() as db:
+            sql = """
+            WITH latest AS (
+                SELECT o.* FROM observations o
+                WHERE o.signal_code = 'VERISIG_DISQUALIFIED_REASON'
+                  AND o.company_id != ''
+                  AND o.rowid = (
+                      SELECT MAX(o2.rowid) FROM observations o2
+                      WHERE o2.company_id = o.company_id
+                        AND o2.signal_code = 'VERISIG_DISQUALIFIED_REASON'
+                  )
+            )
+            SELECT company_id FROM latest
+            WHERE (value_num IS NULL OR value_num != 0)
+              AND value_text IS NOT NULL
+              AND TRIM(value_text) != ''
+            """
+            async with db.execute(sql) as cursor:
+                return {row[0] for row in await cursor.fetchall()}
+
     async def mark_company_profiled(self, company_id: str):
         """Record that a profile pass looked at this company, whether or
         not it was reachable — advances the rotation regardless."""
