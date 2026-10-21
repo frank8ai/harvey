@@ -656,3 +656,259 @@ async def test_review_thread_3_pipeline_report_preserves_opportunity_cards(tmp_p
     assert "opportunity_cards" in report_dict
     assert len(report_dict["opportunity_cards"]) == 1
     assert report_dict["opportunity_cards"][0]["domain"] == "authagent.io"
+
+# ── W1-03-F2-G Qualification-to-Writer Fail-Closed Tests ──────────────
+
+@pytest.mark.asyncio
+async def test_disqualified_company_fails_closed_without_confirmed_catalog(tmp_path, offline_fixtures):
+    """Defect Reproduction / Green verification:
+    When a competitor is evaluated via DevToolsPipelineAdapter under the default
+    PROPOSED Signal Catalog (without manual signal confirmation), qualification
+    determines DISQUALIFIED / DIRECT_COMPETITOR.
+    Without manual state.add_observation, the competitor prospect MUST NOT
+    enter Campaign, email draft, or Outbox when Writer.run() executes.
+    """
+    from harvey.agents.writer import Writer
+    from harvey.collectors.devtools import DevToolsPipelineAdapter
+    from harvey.config import load_config
+    from harvey.models import Company, Prospect
+    from harvey.signals import seed_signal_catalog
+
+    db_file = tmp_path / "red_disq_gate.db"
+    state = StateManager(str(db_file))
+    await state.init_db()
+    await seed_signal_catalog(state)
+
+    # 1. Create company and a new prospect with deliverable email
+    comp_id = await state.add_company(Company(name="TestMailTemp", domain="testmailtemp.io"))
+    await state.add_prospect(Prospect(
+        first_name="Competitor",
+        last_name="Contact",
+        email="contact@testmailtemp.io",
+        company="TestMailTemp",
+        company_id=comp_id,
+        email_status="verified",
+        email_verified=True,
+        status="new",
+    ))
+
+    # 2. Process direct competitor evidence via real DevToolsPipelineAdapter
+    evidence = {
+        "testmailtemp.io": offline_fixtures["direct_competitor"],
+    }
+    adapter = DevToolsPipelineAdapter(state, evidence_bundle=evidence)
+    res = await adapter.run()
+
+    # 3. Assert qualification returned DISQUALIFIED / DIRECT_COMPETITOR
+    assert len(res.opportunity_cards) == 1
+    card = res.opportunity_cards[0]
+    assert card.qualification_status == "DISQUALIFIED"
+    assert card.disqualified is True
+    assert card.disqualified_reason == "DIRECT_COMPETITOR"
+
+    # 4. DummyBrain to prevent real LLM calls
+    class DummyBrain:
+        def load_skills_for_agent(self, agent_name):
+            return []
+        def load_prompt(self, prompt_name, **kwargs):
+            return "Prompt template"
+        async def think(self, prompt, **kwargs):
+            return "Subject: Hello\n\nBody text."
+        async def think_json(self, prompt, **kwargs):
+            if kwargs.get("task") == "personal_email":
+                return {"subject": "quick question", "body": "Hello"}
+            return [
+                {"step": 1, "subject": "hi {{first_name}}", "body": "Hello {{company}}", "delay_days": 0},
+                {"step": 2, "subject": "follow {{first_name}}", "body": "Checking {{company}}", "delay_days": 3},
+                {"step": 3, "subject": "bye {{first_name}}", "body": "Farewell {{company}}", "delay_days": 4},
+            ]
+
+    cfg = load_config()
+    writer = Writer(brain=DummyBrain(), state=state, config=cfg)
+    await writer.run()
+
+    # 5. Assert: Disqualified company cannot enter Campaign, drafts, or Outbox
+    async with state._connect() as db:
+        async with db.execute("SELECT COUNT(*) FROM campaigns") as cur:
+            campaign_count = (await cur.fetchone())[0]
+    outbox = await state.get_outbox()
+    assert campaign_count == 0, f"Expected 0 campaigns, got {campaign_count}"
+    assert len(outbox) == 0, f"Expected 0 outbox items, got {len(outbox)}"
+
+
+@pytest.mark.asyncio
+async def test_sender_blocks_and_cancels_outbox_for_disqualified_company(tmp_path):
+    """Fail-closed gate on send boundary:
+    If an outbox item exists for a prospect whose company is DISQUALIFIED,
+    Sender._drain_due() MUST NOT send the email, must cancel the outbox item,
+    and actual outbound calls must be zero.
+    """
+    from harvey.agents.sender import Sender
+    from harvey.config import load_config, EnvConfig
+    from harvey.models import Company, Prospect
+    from harvey.signals import seed_signal_catalog
+
+    db_file = tmp_path / "sender_disq.db"
+    state = StateManager(str(db_file))
+    await state.init_db()
+    await seed_signal_catalog(state)
+
+    comp_id = await state.add_company(Company(name="Disq Corp", domain="disqcorp.com"))
+    prospect_id = await state.add_prospect(Prospect(
+        first_name="Dan",
+        last_name="Disq",
+        email="dan@disqcorp.com",
+        company="Disq Corp",
+        company_id=comp_id,
+        email_status="verified",
+        email_verified=True,
+        status="queued",
+    ))
+
+    # Add historical staged outbox item (approved for send)
+    item_id = await state.add_outbox_item(
+        prospect_id=prospect_id,
+        to_email="dan@disqcorp.com",
+        subject="Disqualified outreach",
+        body="This must never be sent.",
+        send_at="2000-01-01T00:00:00",
+        status="approved",
+        campaign_id="camp_disq",
+        step=1,
+    )
+
+    # Disqualify company
+    await state.add_observation(
+        "VERISIG_DISQUALIFIED_REASON",
+        company_id=comp_id,
+        value_text="DIRECT_COMPETITOR",
+        confidence=1.0,
+        evidence_url="qualification://disqcorp.com",
+    )
+
+    # Fake mail provider to verify zero outbound email calls
+    class FakeProvider:
+        name = "fake"
+        def __init__(self):
+            self.sent = []
+        def is_configured(self):
+            return True
+        async def send_email(self, *args, **kwargs):
+            self.sent.append(args)
+            from harvey.integrations.mail_provider import SendResult
+            return SendResult(ok=True, message_id="fake_msg")
+
+    cfg = load_config()
+    env = EnvConfig()
+    provider = FakeProvider()
+    sender = Sender(brain=None, state=state, config=cfg, env=env)
+    sender.provider = provider
+
+    await sender._drain_due()
+
+    # Outbound call count must be 0
+    assert len(provider.sent) == 0
+    # Outbox item must be cancelled
+    cancelled = await state.get_outbox(status="cancelled")
+    assert len(cancelled) == 1
+    assert cancelled[0]["id"] == item_id
+    assert "disqualified" in cancelled[0]["error"]
+
+
+@pytest.mark.asyncio
+async def test_revocation_allows_prospect_and_legitimate_client_not_blocked(tmp_path, offline_fixtures):
+    """Audit recovery & legitimate clients:
+    1. Legitimate prospect (non-competitor, e.g. saas_with_otp) must NOT be blocked.
+    2. Disqualified company when corrected/revoked (value_num=0.0) is allowed to enter outreach.
+    """
+    from harvey.agents.writer import Writer
+    from harvey.collectors.devtools import DevToolsPipelineAdapter
+    from harvey.config import load_config
+    from harvey.models import Company, Prospect
+    from harvey.signals import seed_signal_catalog
+
+    db_file = tmp_path / "legit_and_revoke.db"
+    state = StateManager(str(db_file))
+    await state.init_db()
+    await seed_signal_catalog(state)
+
+    # 1. Legitimate client
+    legit_cid = await state.add_company(Company(name="Legit SaaS", domain="authagent.io"))
+    await state.add_prospect(Prospect(
+        first_name="Legit",
+        last_name="User",
+        email="user@authagent.io",
+        company="Legit SaaS",
+        company_id=legit_cid,
+        email_status="verified",
+        email_verified=True,
+        status="new",
+    ))
+
+    # Evaluate legitimate client
+    evidence = {
+        "authagent.io": offline_fixtures["saas_with_otp"],
+    }
+    adapter = DevToolsPipelineAdapter(state, evidence_bundle=evidence)
+    res = await adapter.run()
+    assert res.opportunity_cards[0].qualification_status == "POTENTIAL_FIT"
+    assert res.opportunity_cards[0].disqualified is False
+
+    # 2. Erroneously disqualified client that gets revoked
+    rev_cid = await state.add_company(Company(name="Revoked Co", domain="revoked.io"))
+    await state.add_prospect(Prospect(
+        first_name="Rev",
+        last_name="User",
+        email="user@revoked.io",
+        company="Revoked Co",
+        company_id=rev_cid,
+        email_status="verified",
+        email_verified=True,
+        status="new",
+    ))
+    # Initial disqualification
+    await state.add_observation(
+        "VERISIG_DISQUALIFIED_REASON",
+        company_id=rev_cid,
+        value_text="DIRECT_COMPETITOR",
+        confidence=1.0,
+        evidence_url="qualification://revoked.io",
+    )
+    assert rev_cid in await state.get_disqualified_company_ids()
+
+    # Revoke disqualification via auditable observation (value_num=0.0)
+    await state.add_observation(
+        "VERISIG_DISQUALIFIED_REASON",
+        company_id=rev_cid,
+        value_text="DIRECT_COMPETITOR",
+        value_num=0.0,
+        confidence=1.0,
+        evidence_url="audit://human_correction",
+    )
+    assert rev_cid not in await state.get_disqualified_company_ids()
+
+    class DummyBrain:
+        def load_skills_for_agent(self, agent_name):
+            return []
+        def load_prompt(self, prompt_name, **kwargs):
+            return "Prompt template"
+        async def think(self, prompt, **kwargs):
+            return "Subject: Hello\n\nBody text."
+        async def think_json(self, prompt, **kwargs):
+            if kwargs.get("task") == "personal_email":
+                return {"subject": "quick question", "body": "Hello"}
+            return [
+                {"step": 1, "subject": "hi {{first_name}}", "body": "Hello {{company}}", "delay_days": 0},
+                {"step": 2, "subject": "follow {{first_name}}", "body": "Checking {{company}}", "delay_days": 3},
+                {"step": 3, "subject": "bye {{first_name}}", "body": "Farewell {{company}}", "delay_days": 4},
+            ]
+
+    cfg = load_config()
+    writer = Writer(brain=DummyBrain(), state=state, config=cfg)
+    await writer.run()
+
+    outbox = await state.get_outbox()
+    recipients = {item["to_email"] for item in outbox}
+    # Both legitimate client and revoked client must have drafts staged
+    assert "user@authagent.io" in recipients
+    assert "user@revoked.io" in recipients

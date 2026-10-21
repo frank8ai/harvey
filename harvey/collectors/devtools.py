@@ -912,8 +912,8 @@ async def record_devtools_observations(
     confirmed = await state.confirmed_signal_codes()
     observations: list[dict[str, Any]] = []
 
-    def add_obs(code: str, *, num=None, text="", conf=1.0, url=""):
-        if code in confirmed:
+    def add_obs(code: str, *, num=None, text="", conf=1.0, url="", force: bool = False):
+        if force or code in confirmed:
             observations.append({
                 "company_id": company_id,
                 "signal_code": code,
@@ -939,12 +939,13 @@ async def record_devtools_observations(
                 url=sig.get("source_url", "UNKNOWN"),
             )
 
-    # 2. Record derived qualification states
+    # 2. Record derived qualification states (internal qualification states bypass confirmation gate)
     add_obs(
         "VERISIG_EVIDENCE_SUFFICIENCY",
         text=qualification.evidence_quality,
         conf=1.0,
         url=f"qualification://{qualification.domain or 'unknown'}",
+        force=True,
     )
 
     if qualification.disqualified and qualification.disqualified_reason:
@@ -953,6 +954,7 @@ async def record_devtools_observations(
             text=qualification.disqualified_reason,
             conf=1.0,
             url=f"qualification://{qualification.domain or 'unknown'}",
+            force=True,
         )
 
     if not observations:

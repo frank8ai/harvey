@@ -478,6 +478,19 @@ class Sender:
                 )
                 continue
 
+            # Fail-closed gate: Disqualified company cannot be sent under any circumstances.
+            if prospect.company_id:
+                disqualified_ids = await self.state.get_disqualified_company_ids()
+                if prospect.company_id in disqualified_ids:
+                    await self.state.update_outbox_item(
+                        item["id"], status="cancelled",
+                        error="company disqualified by qualification gate",
+                    )
+                    logger.warning(
+                        f"Sender: cancelled email to {item['to_email']}: company {prospect.company_id} is disqualified."
+                    )
+                    continue
+
             # Stop-on-reply / opt-out: never continue a sequence after contact.
             if item["kind"] == "sequence" and prospect.status in STOP_STATUSES:
                 await self.state.update_outbox_item(
