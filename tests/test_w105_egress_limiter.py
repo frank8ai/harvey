@@ -573,11 +573,17 @@ async def test_auto_renewal_prevents_double_leasing(tmp_path):
 
         # Advance clock by 35s in simulated increments
         clock.advance(20.0)
-        await asyncio.sleep(0.01)
+        for _ in range(50):
+            if l1.expires_at >= 150.0:
+                break
+            await asyncio.sleep(0.01)
         assert l1.expires_at >= 150.0  # renewed!
 
         clock.advance(15.0)
-        await asyncio.sleep(0.01)
+        for _ in range(50):
+            if l1.expires_at >= 165.0:
+                break
+            await asyncio.sleep(0.01)
         assert l1.expires_at >= 165.0  # renewed again!
 
         # Worker 2 attempts acquire: MUST be blocked
@@ -722,3 +728,198 @@ asyncio.run(main())
         assert await limiter.get_active_leases_count("crash-target.com") == 0
 
     asyncio.run(sweep())
+
+
+# ── 13. Clock Consistency & Cross-Reboot Rate Limiting Invariants (W1-05-B-R2) ──
+
+@pytest.mark.asyncio
+async def test_http_date_parsed_against_unix_epoch_wall_clock(tmp_path):
+    """
+    RFC HTTP-Date Retry-After MUST calculate remaining delay against wall-clock UTC,
+    never directly subtracting monotonic timestamp (SystemClock.now()).
+    """
+    db_file = tmp_path / "http_date_clock.db"
+    # Simulated monotonic clock at 500.0, wall clock at Unix Epoch 1700000000.0
+    clock = FakeClock(start_time=500.0, wall_time=1700000000.0, auto_advance_on_sleep=True)
+    config = LimiterConfig(offline_mode=False, min_domain_interval_seconds=0.0)
+    limiter = PersistentEgressLimiter(str(db_file), config, clock=clock)
+    await limiter.init_db()
+
+    lease = await limiter.acquire("https://rfc-date.test")
+    assert lease.acquired_at == 500.0
+
+    # Server returns HTTP-Date 45s in future (UTC: 1700000045.0)
+    import email.utils
+    date_str = email.utils.formatdate(1700000045.0, usegmt=True)
+
+    await lease.release(
+        outcome=LeaseReleaseOutcome.RATE_LIMITED,
+        retry_after_seconds=date_str,
+        http_status=429,
+    )
+
+    state = await limiter.get_domain_state("rfc-date.test")
+    # Cooldown duration must be exactly 45.0s, so monotonic cooldown_until is 545.0
+    assert state["cooldown_until"] == 545.0
+    assert state["consecutive_failures"] == 1
+
+    # At T=500.0, acquire must timeout
+    with pytest.raises(ConcurrencyTimeoutError):
+        await limiter.acquire("https://rfc-date.test", timeout=0.1)
+
+    # Advance clock 46s
+    clock.advance(46.0)
+    lease2 = await limiter.acquire("https://rfc-date.test", timeout=0.5)
+    assert lease2.domain == "rfc-date.test"
+    await lease2.release()
+
+
+@pytest.mark.asyncio
+async def test_cross_reboot_preserves_active_429_cooldown(tmp_path):
+    """
+    OS reboot (monotonic clock baseline change) MUST NOT prematurely clear
+    a 429 cooldown that is still active in wall-clock UTC.
+    """
+    db_file = tmp_path / "reboot_cooldown.db"
+
+    # Pre-reboot instance:
+    # Monotonic clock: 90000.0, Wall clock: 1700000000.0, Boot ID: "boot-session-1"
+    c1 = FakeClock(start_time=90000.0, wall_time=1700000000.0, boot_id="boot-session-1")
+    l1 = PersistentEgressLimiter(str(db_file), LimiterConfig(offline_mode=False), clock=c1)
+    await l1.init_db()
+
+    lease = await l1.acquire("https://cooldown-target.com")
+    # 429 with 120s cooldown
+    await lease.release(outcome=LeaseReleaseOutcome.RATE_LIMITED, retry_after_seconds=120.0, http_status=429)
+
+    # OS Reboots!
+    # Machine was off for 30s.
+    # Post-reboot instance:
+    # Monotonic clock resets to 10.0! Wall clock is now 1700000030.0.
+    # Active cooldown still has 90s remaining (120 - 30).
+    c2 = FakeClock(start_time=10.0, wall_time=1700000030.0, boot_id="boot-session-2")
+    l2 = PersistentEgressLimiter(str(db_file), LimiterConfig(offline_mode=False), clock=c2)
+
+    # Check domain state after reboot
+    state = await l2.get_domain_state("cooldown-target.com")
+    # Monotonic cooldown_until must be aligned to current boot monotonic clock (10.0 + 90.0 = 100.0)
+    assert state["cooldown_until"] == 100.0
+    assert state["consecutive_failures"] == 1
+
+    # Acquire must still be blocked by active cooldown!
+    acquired, wait_sugg = await l2._try_acquire_transaction("cooldown-target.com", 1, c2.now())
+    assert acquired is None
+    assert 89.0 <= wait_sugg <= 91.0
+
+    # Advance clock past cooldown: 91s
+    c2.advance(91.0)
+    lease2 = await l2.acquire("https://cooldown-target.com", timeout=1.0)
+    assert lease2.domain == "cooldown-target.com"
+    await lease2.release()
+
+
+@pytest.mark.asyncio
+async def test_cross_reboot_clears_expired_cooldown_without_deadlock(tmp_path):
+    """
+    If cooldown expired while machine was powered off, post-reboot acquire
+    MUST NOT deadlock for hours due to old large monotonic timestamps.
+    """
+    db_file = tmp_path / "reboot_expired.db"
+
+    # Pre-reboot: monotonic=500000.0 (high uptime), cooldown 60s
+    c1 = FakeClock(start_time=500000.0, wall_time=1700000000.0, boot_id="boot-old")
+    l1 = PersistentEgressLimiter(str(db_file), LimiterConfig(offline_mode=False), clock=c1)
+    await l1.init_db()
+
+    lease = await l1.acquire("https://expired-cooldown.com")
+    await lease.release(outcome=LeaseReleaseOutcome.RATE_LIMITED, retry_after_seconds=60.0, http_status=429)
+
+    # Machine was off for 1 hour (3600s). Cooldown completely expired!
+    # Post-reboot monotonic clock is at 5.0.
+    c2 = FakeClock(start_time=5.0, wall_time=1700003600.0, boot_id="boot-new")
+    l2 = PersistentEgressLimiter(str(db_file), LimiterConfig(offline_mode=False), clock=c2)
+
+    state = await l2.get_domain_state("expired-cooldown.com")
+    assert state["cooldown_until"] == 0.0
+
+    # Acquire immediately succeeds without multi-day wait!
+    lease2 = await l2.acquire("https://expired-cooldown.com", timeout=0.5)
+    assert lease2.domain == "expired-cooldown.com"
+    await lease2.release()
+
+
+@pytest.mark.asyncio
+async def test_cross_reboot_cleans_up_stale_pre_reboot_leases(tmp_path):
+    """
+    Active leases held by workers before an OS reboot MUST be reclaimed immediately
+    on post-reboot startup via boot_id mismatch, freeing concurrency slots.
+    """
+    db_file = tmp_path / "reboot_stale_leases.db"
+
+    c1 = FakeClock(start_time=100.0, wall_time=1700000000.0, boot_id="boot-pre")
+    l1 = PersistentEgressLimiter(str(db_file), LimiterConfig(offline_mode=False, global_concurrency=1), clock=c1)
+    await l1.init_db()
+
+    # Pre-reboot worker acquired lease with 30s TTL
+    lease1 = await l1.acquire("https://reboot-slot.com")
+    assert await l1.get_active_leases_count() == 1
+
+    # Sudden reboot 5s later (TTL not yet naturally expired)
+    c2 = FakeClock(start_time=5.0, wall_time=1700000005.0, boot_id="boot-post")
+    l2 = PersistentEgressLimiter(str(db_file), LimiterConfig(offline_mode=False, global_concurrency=1), clock=c2)
+
+    # Explicit recovery pass sweeps pre-reboot leases
+    reclaimed = await l2.recover_stale_leases()
+    assert reclaimed == 1
+    assert await l2.get_active_leases_count() == 0
+
+    # Post-reboot worker can now immediately acquire the global concurrency slot!
+    lease2 = await l2.acquire("https://reboot-slot.com", timeout=0.5)
+    assert lease2.domain == "reboot-slot.com"
+    await lease2.release()
+
+
+@pytest.mark.asyncio
+async def test_lease_auto_renewal_failure_aborts_bound_request_task(tmp_path):
+    """
+    When background lease renewal fails (e.g. database error or reclaimed by another process),
+    the bound controlled request task MUST be immediately aborted via cancellation.
+    """
+    db_file = tmp_path / "renew_abort.db"
+    clock = FakeClock(start_time=100.0, auto_advance_on_sleep=True)
+    config = LimiterConfig(offline_mode=False, lease_ttl_seconds=10.0)
+    limiter = PersistentEgressLimiter(str(db_file), config, clock=clock)
+    await limiter.init_db()
+
+    lease = await limiter.acquire("https://abort-test.com")
+    task_cancelled_properly = False
+
+    async def controlled_request_worker():
+        nonlocal task_cancelled_properly
+        try:
+            async with lease:
+                # Long-running HTTP download
+                await asyncio.sleep(100.0)
+        except asyncio.CancelledError:
+            task_cancelled_properly = True
+            raise
+
+    worker_task = asyncio.create_task(controlled_request_worker())
+    await asyncio.sleep(0.01)
+
+    # Force a renewal failure by dropping the lease from DB behind its back
+    conn = await limiter._get_conn()
+    await conn.execute("DELETE FROM egress_leases WHERE lease_id = ?", (lease.lease_id,))
+    await conn.commit()
+    await conn.close()
+
+    # Explicitly attempt renewal or advance clock so auto-renew fires
+    with pytest.raises(LeaseExpiredError):
+        await lease.renew()
+
+    # Worker task must be cancelled by the abort mechanism
+    with pytest.raises(asyncio.CancelledError):
+        await worker_task
+
+    assert task_cancelled_properly is True
+    assert lease._lost_ownership is True

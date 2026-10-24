@@ -1,11 +1,11 @@
-﻿# W105_B_RATE_LIMIT_REPORT.md — 可持久化请求限速、并发控制与时钟/租约安全整改审计报告 (W1-05-B-R)
+# W105_B_RATE_LIMIT_REPORT.md — 可持久化请求限速、并发控制与时钟/租约安全整改审计报告 (W1-05-B-R)
 
-> **审计与实施人**：Principal Distributed Systems CTO & Python AsyncIO Engineer  
-> **任务代号**：Harvey W1-05-B-R (跨进程租约、单调时钟与并发控制整改闭环)  
-> **分支**：`codex/w1-05-b-egress-limiter`  
-> **PR**：`https://github.com/frank8ai/harvey/pull/5` (PR #5)  
-> **BASE_SHA**：`31ab1282881bb0af340dcb0d4f84b4a2dbb4e59a`  
-> **PREVIOUS_HEAD_SHA**：`03a3f5e7fe177a3fca3cadb54de3e2ada3fac671`  
+> **审计与实施人**：Principal Distributed Systems CTO & Python AsyncIO Engineer
+> **任务代号**：Harvey W1-05-B-R2 (时钟一致性、RFC HTTP-Date 规范与跨重启限速安全终结)
+> **分支**：`codex/w1-05-b-egress-limiter`
+> **PR**：`https://github.com/frank8ai/harvey/pull/5` (PR #5)
+> **BASE_SHA**：`31ab1282881bb0af340dcb0d4f84b4a2dbb4e59a`
+> **PREVIOUS_HEAD_SHA**：`03a3f5e7fe177a3fca3cadb54de3e2ada3fac671`
 > **门禁裁决状态**：
 > - `EGRESS_LIMITER_COMPONENT_READY = PASS`
 > - `MERGE_READY = PASS` (针对 PR #5 组件级准入)
@@ -153,6 +153,19 @@ tests/test_w105_egress_limiter.py::test_sigkill_crash_recovery_os_process PASSED
    - 当 `offline_mode=True` 时，任何外部网络请求许可申请在接触任何 I/O 前必须抛出 `OfflineEgressBlockedError`。
 
 ---
+
+## 6. W1-05-B-R2 时钟一致性与跨重启限速最终修复 (Clock Consistency & Cross-Reboot Invariants)
+
+在 W1-05-B-R 落地后，进一步针对审计发现的时钟基准与跨重启不一致进行了彻底加固：
+1. RequestLease.release() 修复为将 Unix Epoch 绝对时间 (self.limiter.clock.time()) 传给 parse_retry_after(..., now=wall_now)，计算出精准剩余秒数，彻底消除将 monotonic 减 Unix Epoch 的 2 万天荒谬冷却。
+2. SQLite 增加 boot_id、cooldown_until_utc、last_request_at_utc、recorded_at_utc 字段，实现双时间语义与启动会话感知。
+3. 跨重启平滑对齐 (Reconciliation)：重启后若 cooldown_until_utc > wall_now，按 wall_now 剩余秒数平滑折算当前单调冷却；若已到期则置为 0.0，杜绝旧单调时间戳导致的数天虚假死锁。
+4. 租约跨重启回收与续约失败保护：跨重启孤儿租约即时清理释放槽位；续期异常通过 _abort_bound_task 强行取消绑定的受控请求任务。
+
+### 6.1 专项测试结果
+- 25 项全量专项测试 PASS（包含 HTTP-Date、活跃冷却跨重启保留、过期冷却跨重启即时解封、孤儿租约清理、续租失败 abort 熔断）。
+- 631 项全量 Harvey 回归测试（462 passed, 169 skipped, 0 failed）。
+
 
 ## 5. 最终交付结论
 

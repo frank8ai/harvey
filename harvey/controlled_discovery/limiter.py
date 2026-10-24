@@ -70,11 +70,58 @@ def is_pid_alive(pid: int) -> bool:
             return e.errno == errno.EPERM
 
 
+def get_system_boot_id() -> str:
+    """
+    Retrieve stable system boot identifier across processes for the current OS boot.
+    Distinguishes pre-reboot and post-reboot runtime environments.
+    """
+    # 1. Linux standard kernel boot_id
+    if sys.platform.startswith("linux"):
+        try:
+            with open("/proc/sys/kernel/random/boot_id", "r") as f:
+                val = f.read().strip()
+                if val:
+                    return val
+        except Exception:
+            pass
+    # 2. Windows via GetTickCount64 and system time
+    if sys.platform == "win32":
+        try:
+            kernel32 = ctypes.windll.kernel32
+            kernel32.GetTickCount64.restype = ctypes.c_uint64
+            tick_ms = kernel32.GetTickCount64()
+            boot_sec = int(time.time() - (tick_ms / 1000.0))
+            boot_bucket = (boot_sec // 5) * 5
+            return f"win-boot-{boot_bucket}"
+        except Exception:
+            pass
+    # 3. macOS / Darwin via sysctl kern.boottime
+    if sys.platform == "darwin":
+        try:
+            import subprocess
+            out = subprocess.check_output(["sysctl", "-n", "kern.boottime"], timeout=1).decode()
+            return f"darwin-{out.strip()}"
+        except Exception:
+            pass
+    # 4. Standard fallback based on wall vs monotonic offset
+    boot_sec = int(time.time() - time.monotonic())
+    boot_bucket = (boot_sec // 5) * 5
+    return f"gen-boot-{boot_bucket}"
+
+
 # ── Clock Protocol & Implementations ──────────────────────────────────────────
 
 class Clock(Protocol):
     def now(self) -> float:
         """Return monotonic or wall-clock timestamp in seconds."""
+        ...
+
+    def time(self) -> float:
+        """Return wall-clock UTC Unix epoch timestamp in seconds."""
+        ...
+
+    def boot_id(self) -> str:
+        """Return boot identifier representing the current OS/clock domain boot session."""
         ...
 
     async def sleep(self, seconds: float) -> None:
@@ -85,10 +132,17 @@ class Clock(Protocol):
 class SystemClock:
     """
     Monotonic system clock immune to NTP / system wall-clock backward and forward steps.
-    Guarantees consistent rate intervals, lease deadlines, and monotonic cooldown calculation.
+    Provides monotonic now() for local rate pacing and lease timeouts, and wall-clock time()
+    for Unix-epoch HTTP dates and cross-reboot durable timestamps.
     """
     def now(self) -> float:
         return time.monotonic()
+
+    def time(self) -> float:
+        return time.time()
+
+    def boot_id(self) -> str:
+        return get_system_boot_id()
 
     async def sleep(self, seconds: float) -> None:
         await asyncio.sleep(seconds)
@@ -101,13 +155,37 @@ class FakeClock:
     Supports synchronous tick callbacks for auto-renew and TTL expiration simulations.
     """
 
-    def __init__(self, start_time: float = 1000.0, auto_advance_on_sleep: bool = True):
+    def __init__(
+        self,
+        start_time: float = 1000.0,
+        auto_advance_on_sleep: bool = True,
+        wall_time: Optional[float] = None,
+        boot_id: str = "fake-boot-default",
+    ):
         self._current_time = float(start_time)
         self.auto_advance_on_sleep = auto_advance_on_sleep
+        self._wall_offset = (
+            float(wall_time) - self._current_time
+            if wall_time is not None
+            else 1700000000.0 - self._current_time
+        )
+        self._boot_id = boot_id
         self._tick_listeners: list[Callable[[float], None]] = []
 
     def now(self) -> float:
         return self._current_time
+
+    def time(self) -> float:
+        return self._current_time + self._wall_offset
+
+    def set_wall_time(self, wall_ts: float) -> None:
+        self._wall_offset = float(wall_ts) - self._current_time
+
+    def boot_id(self) -> str:
+        return self._boot_id
+
+    def set_boot_id(self, boot_id: str) -> None:
+        self._boot_id = boot_id
 
     def add_tick_listener(self, cb: Callable[[float], None]) -> None:
         if cb not in self._tick_listeners:
@@ -292,6 +370,8 @@ def parse_retry_after(value: Union[str, int, float, None], now: Optional[float] 
     """
     Parse HTTP Retry-After header value into seconds delay.
     Supports integer seconds ('120') or RFC-2822 / RFC-1123 HTTP dates.
+    HTTP-Date specifies an absolute UTC wall-clock deadline, so calculation
+    uses Unix epoch seconds (now or time.time()).
     """
     if value is None:
         return None
@@ -362,7 +442,12 @@ class RequestLease:
         if bytes_metered is not None:
             self.bytes_metered = bytes_metered
 
-        parsed_retry_after = parse_retry_after(retry_after_seconds, now=self.limiter.clock.now())
+        wall_now = (
+            self.limiter.clock.time()
+            if hasattr(self.limiter.clock, "time")
+            else time.time()
+        )
+        parsed_retry_after = parse_retry_after(retry_after_seconds, now=wall_now)
 
         await self.limiter._release_lease(
             lease_id=self.lease_id,
@@ -527,7 +612,8 @@ CREATE TABLE IF NOT EXISTS egress_leases (
     worker_pid INTEGER NOT NULL,
     attempt INTEGER NOT NULL DEFAULT 1,
     acquired_at REAL NOT NULL,
-    expires_at REAL NOT NULL
+    expires_at REAL NOT NULL,
+    boot_id TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_egress_leases_domain ON egress_leases(domain);
@@ -537,7 +623,10 @@ CREATE TABLE IF NOT EXISTS egress_domain_state (
     domain TEXT PRIMARY KEY,
     last_request_at REAL NOT NULL DEFAULT 0.0,
     cooldown_until REAL NOT NULL DEFAULT 0.0,
-    consecutive_failures INTEGER NOT NULL DEFAULT 0
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    cooldown_until_utc REAL NOT NULL DEFAULT 0.0,
+    last_request_at_utc REAL NOT NULL DEFAULT 0.0,
+    boot_id TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS egress_audit_log (
@@ -551,7 +640,9 @@ CREATE TABLE IF NOT EXISTS egress_audit_log (
     outcome TEXT NOT NULL,
     http_status INTEGER,
     duration_seconds REAL NOT NULL,
-    recorded_at REAL NOT NULL
+    recorded_at REAL NOT NULL,
+    recorded_at_utc REAL NOT NULL DEFAULT 0.0,
+    boot_id TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_egress_audit_domain ON egress_audit_log(domain);
@@ -591,6 +682,31 @@ class PersistentEgressLimiter:
                 await db.execute("PRAGMA synchronous=NORMAL;")
                 await db.execute("PRAGMA busy_timeout=10000;")
                 await db.executescript(LIMITER_SCHEMA)
+                # Schema migration for existing databases: ensure newly added columns exist
+                cursor = await db.execute("PRAGMA table_info(egress_leases);")
+                lease_cols = [r[1] for r in await cursor.fetchall()]
+                await cursor.close()
+                if "boot_id" not in lease_cols:
+                    await db.execute("ALTER TABLE egress_leases ADD COLUMN boot_id TEXT NOT NULL DEFAULT '';")
+
+                cursor = await db.execute("PRAGMA table_info(egress_domain_state);")
+                state_cols = [r[1] for r in await cursor.fetchall()]
+                await cursor.close()
+                if "cooldown_until_utc" not in state_cols:
+                    await db.execute("ALTER TABLE egress_domain_state ADD COLUMN cooldown_until_utc REAL NOT NULL DEFAULT 0.0;")
+                if "last_request_at_utc" not in state_cols:
+                    await db.execute("ALTER TABLE egress_domain_state ADD COLUMN last_request_at_utc REAL NOT NULL DEFAULT 0.0;")
+                if "boot_id" not in state_cols:
+                    await db.execute("ALTER TABLE egress_domain_state ADD COLUMN boot_id TEXT NOT NULL DEFAULT '';")
+
+                cursor = await db.execute("PRAGMA table_info(egress_audit_log);")
+                audit_cols = [r[1] for r in await cursor.fetchall()]
+                await cursor.close()
+                if "recorded_at_utc" not in audit_cols:
+                    await db.execute("ALTER TABLE egress_audit_log ADD COLUMN recorded_at_utc REAL NOT NULL DEFAULT 0.0;")
+                if "boot_id" not in audit_cols:
+                    await db.execute("ALTER TABLE egress_audit_log ADD COLUMN boot_id TEXT NOT NULL DEFAULT '';")
+
                 await db.commit()
             self._initialized = True
 
@@ -684,35 +800,71 @@ class PersistentEgressLimiter:
 
             # Step 1: Clean up expired leases
             cursor = await conn.execute(
-                "SELECT lease_id, worker_pid, expires_at FROM egress_leases WHERE expires_at < ?",
-                (now,),
+                "SELECT lease_id, worker_pid, expires_at, boot_id FROM egress_leases",
             )
-            expired_rows = await cursor.fetchall()
+            all_lease_rows = await cursor.fetchall()
             await cursor.close()
 
-            if expired_rows:
-                expired_ids = [r[0] for r in expired_rows]
-                placeholders = ",".join("?" for _ in expired_ids)
+            cur_boot = self.clock.boot_id() if hasattr(self.clock, "boot_id") else ""
+            stale_ids = []
+            for lid, lpid, lexp, lboot in all_lease_rows:
+                # Reclaim if expired or belonging to dead PID or belonging to previous OS boot
+                if lexp < now or (lboot and cur_boot and lboot != cur_boot) or not is_pid_alive(lpid):
+                    stale_ids.append(lid)
+
+            if stale_ids:
+                placeholders = ",".join("?" for _ in stale_ids)
                 await conn.execute(
                     f"DELETE FROM egress_leases WHERE lease_id IN ({placeholders})",
-                    expired_ids,
+                    stale_ids,
                 )
-
-            await conn.execute(
-                "DELETE FROM egress_leases WHERE expires_at < ?",
-                (now,),
-            )
 
             # Step 2: Check domain pacing and cooldown
             cursor = await conn.execute(
-                "SELECT last_request_at, cooldown_until FROM egress_domain_state WHERE domain = ?",
+                "SELECT last_request_at, cooldown_until, cooldown_until_utc, last_request_at_utc, boot_id FROM egress_domain_state WHERE domain = ?",
                 (domain,),
             )
             row = await cursor.fetchone()
             await cursor.close()
 
             if row:
-                last_request_at, cooldown_until = row
+                last_request_at, cooldown_until, cooldown_until_utc, last_request_at_utc, db_boot_id = row
+                wall_now = self.clock.time() if hasattr(self.clock, "time") else time.time()
+
+                # Cross-reboot reconciliation:
+                # If database boot_id differs from current OS boot_id (reboot happened),
+                # monotonic timestamps from the old boot are no longer valid.
+                if db_boot_id and cur_boot and db_boot_id != cur_boot:
+                    # Check if 429 cooldown is still active under wall-clock UTC
+                    if cooldown_until_utc > wall_now:
+                        remaining_cooldown = cooldown_until_utc - wall_now
+                        cooldown_until = now + remaining_cooldown
+                    else:
+                        cooldown_until = 0.0
+
+                    # Check min interval pacing across reboot
+                    if last_request_at_utc > 0 and (wall_now - last_request_at_utc) < self.config.min_domain_interval_seconds:
+                        elapsed_wall = wall_now - last_request_at_utc
+                        last_request_at = now - elapsed_wall
+                    else:
+                        last_request_at = now - self.config.min_domain_interval_seconds
+
+                    # Update domain state with aligned monotonic time and current boot_id
+                    await conn.execute(
+                        """
+                        UPDATE egress_domain_state
+                        SET last_request_at = ?, cooldown_until = ?, boot_id = ?
+                        WHERE domain = ?
+                        """,
+                        (last_request_at, cooldown_until, cur_boot, domain),
+                    )
+                else:
+                    # Monotonic sanity check: if cooldown_until_utc was set, ensure monotonic cooldown aligns
+                    if cooldown_until_utc > 0:
+                        if wall_now >= cooldown_until_utc:
+                            cooldown_until = 0.0
+                        else:
+                            cooldown_until = max(cooldown_until, now + (cooldown_until_utc - wall_now))
 
                 # Clock skew defense
                 if last_request_at > now:
@@ -755,24 +907,28 @@ class PersistentEgressLimiter:
             lease_id = str(uuid.uuid4())
             pid = os.getpid()
             expires_at = now + self.config.lease_ttl_seconds
+            wall_now = self.clock.time() if hasattr(self.clock, "time") else time.time()
+            cur_boot = self.clock.boot_id() if hasattr(self.clock, "boot_id") else ""
 
             await conn.execute(
                 """
-                INSERT INTO egress_leases (lease_id, domain, worker_pid, attempt, acquired_at, expires_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO egress_leases (lease_id, domain, worker_pid, attempt, acquired_at, expires_at, boot_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (lease_id, domain, pid, attempt, now, expires_at),
+                (lease_id, domain, pid, attempt, now, expires_at, cur_boot),
             )
 
             # Update last_request_at to current time immediately upon grant
             await conn.execute(
                 """
-                INSERT INTO egress_domain_state (domain, last_request_at, cooldown_until, consecutive_failures)
-                VALUES (?, ?, 0.0, 0)
+                INSERT INTO egress_domain_state (domain, last_request_at, cooldown_until, consecutive_failures, last_request_at_utc, boot_id)
+                VALUES (?, ?, 0.0, 0, ?, ?)
                 ON CONFLICT(domain) DO UPDATE SET
-                    last_request_at = excluded.last_request_at
+                    last_request_at = excluded.last_request_at,
+                    last_request_at_utc = excluded.last_request_at_utc,
+                    boot_id = excluded.boot_id
                 """,
-                (domain, now),
+                (domain, now, wall_now, cur_boot),
             )
 
             await conn.commit()
@@ -854,6 +1010,9 @@ class PersistentEgressLimiter:
 
             failures = row[0] if row else 0
             cooldown_until = 0.0
+            cooldown_until_utc = 0.0
+            wall_now = self.clock.time() if hasattr(self.clock, "time") else time.time()
+            cur_boot = self.clock.boot_id() if hasattr(self.clock, "boot_id") else ""
 
             if outcome == LeaseReleaseOutcome.SUCCESS:
                 failures = 0
@@ -868,6 +1027,7 @@ class PersistentEgressLimiter:
                         self.config.max_retry_backoff_seconds,
                     )
                 cooldown_until = now + cooldown_duration
+                cooldown_until_utc = wall_now + cooldown_duration
             elif outcome in (LeaseReleaseOutcome.FAILURE, LeaseReleaseOutcome.TIMEOUT):
                 failures += 1
                 cooldown_duration = min(
@@ -875,17 +1035,24 @@ class PersistentEgressLimiter:
                     self.config.max_retry_backoff_seconds,
                 )
                 cooldown_until = now + cooldown_duration
+                cooldown_until_utc = wall_now + cooldown_duration
 
             await conn.execute(
                 """
-                INSERT INTO egress_domain_state (domain, last_request_at, cooldown_until, consecutive_failures)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO egress_domain_state (
+                    domain, last_request_at, cooldown_until, consecutive_failures,
+                    cooldown_until_utc, last_request_at_utc, boot_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(domain) DO UPDATE SET
                     last_request_at = excluded.last_request_at,
                     cooldown_until = MAX(egress_domain_state.cooldown_until, excluded.cooldown_until),
-                    consecutive_failures = excluded.consecutive_failures
+                    consecutive_failures = excluded.consecutive_failures,
+                    cooldown_until_utc = MAX(egress_domain_state.cooldown_until_utc, excluded.cooldown_until_utc),
+                    last_request_at_utc = excluded.last_request_at_utc,
+                    boot_id = excluded.boot_id
                 """,
-                (domain, now, cooldown_until, failures),
+                (domain, now, cooldown_until, failures, cooldown_until_utc, wall_now, cur_boot),
             )
 
             # 3. Insert audit log record for idempotent settlement tracking
@@ -893,13 +1060,15 @@ class PersistentEgressLimiter:
                 """
                 INSERT INTO egress_audit_log (
                     lease_id, domain, worker_pid, attempt, redirects,
-                    bytes_metered, outcome, http_status, duration_seconds, recorded_at
+                    bytes_metered, outcome, http_status, duration_seconds, recorded_at,
+                    recorded_at_utc, boot_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     lease_id, domain, os.getpid(), attempt, redirects_used,
                     bytes_metered, outcome.value, http_status, duration, now,
+                    wall_now, cur_boot,
                 ),
             )
 
@@ -997,10 +1166,13 @@ class PersistentEgressLimiter:
     async def get_domain_state(self, url_or_domain: str) -> Dict[str, Any]:
         """Get current rate limit status and failure count for a domain."""
         domain = normalize_domain(url_or_domain)
+        now = self.clock.now()
+        wall_now = self.clock.time() if hasattr(self.clock, "time") else time.time()
+        cur_boot = self.clock.boot_id() if hasattr(self.clock, "boot_id") else ""
         conn = await self._get_conn()
         try:
             cursor = await conn.execute(
-                "SELECT last_request_at, cooldown_until, consecutive_failures FROM egress_domain_state WHERE domain = ?",
+                "SELECT last_request_at, cooldown_until, consecutive_failures, cooldown_until_utc, last_request_at_utc, boot_id FROM egress_domain_state WHERE domain = ?",
                 (domain,),
             )
             row = await cursor.fetchone()
@@ -1012,11 +1184,23 @@ class PersistentEgressLimiter:
                     "cooldown_until": 0.0,
                     "consecutive_failures": 0,
                 }
+            last_req, cool_until, failures, cool_utc, last_req_utc, db_boot = row
+            if db_boot and cur_boot and db_boot != cur_boot:
+                if cool_utc > wall_now:
+                    cool_until = now + (cool_utc - wall_now)
+                else:
+                    cool_until = 0.0
+            elif cool_utc > 0:
+                if wall_now >= cool_utc:
+                    cool_until = 0.0
+                else:
+                    cool_until = max(cool_until, now + (cool_utc - wall_now))
+
             return {
                 "domain": domain,
-                "last_request_at": row[0],
-                "cooldown_until": row[1],
-                "consecutive_failures": row[2],
+                "last_request_at": last_req,
+                "cooldown_until": cool_until,
+                "consecutive_failures": failures,
             }
         finally:
             await conn.close()
@@ -1024,29 +1208,27 @@ class PersistentEgressLimiter:
     async def recover_stale_leases(self) -> int:
         """Explicit recovery pass: delete expired leases, freeing capacity for surviving workers."""
         now = self.clock.now()
+        cur_boot = self.clock.boot_id() if hasattr(self.clock, "boot_id") else ""
         conn = await self._get_conn()
         try:
             await conn.execute("BEGIN IMMEDIATE;")
 
-            # Sweep expired leases
-            cursor = await conn.execute(
-                "DELETE FROM egress_leases WHERE expires_at < ?",
-                (now,),
-            )
-            deleted = cursor.rowcount
-            await cursor.close()
-
-            # Sweep dead worker PIDs (SIGKILL crash recovery)
-            cursor = await conn.execute("SELECT lease_id, worker_pid FROM egress_leases")
+            # Sweep expired leases or dead worker PIDs or old boot leases
+            cursor = await conn.execute("SELECT lease_id, worker_pid, expires_at, boot_id FROM egress_leases")
             active_rows = await cursor.fetchall()
             await cursor.close()
 
-            dead_ids = [lid for lid, pid in active_rows if not is_pid_alive(pid)]
-            if dead_ids:
-                placeholders = ",".join("?" for _ in dead_ids)
+            deleted = 0
+            stale_ids = []
+            for lid, pid, exp, lboot in active_rows:
+                if exp < now or (lboot and cur_boot and lboot != cur_boot) or not is_pid_alive(pid):
+                    stale_ids.append(lid)
+
+            if stale_ids:
+                placeholders = ",".join("?" for _ in stale_ids)
                 cursor = await conn.execute(
                     f"DELETE FROM egress_leases WHERE lease_id IN ({placeholders})",
-                    dead_ids,
+                    stale_ids,
                 )
                 deleted += cursor.rowcount
                 await cursor.close()
