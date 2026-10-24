@@ -529,14 +529,19 @@ def test_receipt_replay_prevention_and_lifecycle(tmp_path):
         key_id="key-active-v1",
     )
 
-    # 1. First import succeeds
+    # 1. First import succeeds with full cryptographic and content verification
     res1 = replay_ledger.check_and_record_receipt(
         receipt1,
         expected_run_id="run-alpha",
         expected_target_id="target-corp-1",
+        secret_key=secret_key,
+        raw_content_bytes=raw_content,
     )
     assert res1.is_trusted is True
     assert res1.status == ReceiptValidationStatus.VERIFIED
+    assert res1.signature_verified is True
+    assert res1.content_verified is True
+    assert res1.replay_accepted is True
 
     # 2. Duplicate import in same run is blocked
     res_dup = replay_ledger.check_and_record_receipt(
@@ -746,3 +751,242 @@ def test_unknown_and_negative_cost_fail_closed(tmp_path):
     # Settle with negative cost must fail closed
     with pytest.raises(ValueError, match="cannot be negative"):
         ledger.settle(r.reservation_id, status="success", actual_cost_usd=-1.0)
+
+
+# ── Top-level worker for cross-process receipt consumption race ────────
+def _worker_consume_receipt_race(
+    db_path: str,
+    receipt_dict: dict,
+    expected_run_id: str,
+    expected_target_id: str,
+    secret_key: bytes,
+    raw_content: bytes,
+    results_queue: mp.Queue,
+):
+    """Worker process attempting to record and verify receipt concurrently."""
+    try:
+        from harvey.controlled_discovery.receipt import (
+            CollectorReceipt,
+            ReceiptReplayLedger,
+            ReceiptValidationStatus,
+        )
+        receipt = CollectorReceipt.from_dict(receipt_dict)
+        ledger = ReceiptReplayLedger(db_path=db_path)
+        res = ledger.check_and_record_receipt(
+            receipt,
+            expected_run_id=expected_run_id,
+            expected_target_id=expected_target_id,
+            secret_key=secret_key,
+            raw_content_bytes=raw_content,
+        )
+        results_queue.put((res.status.value, res.is_trusted, res.reason))
+    except Exception as e:
+        results_queue.put(("EXCEPTION", False, str(e)))
+
+
+# ── 16. Receipt Replay Ledger: Cryptographic & Content Verification Matrix ────
+def test_replay_ledger_cryptographic_and_content_verification_matrix(tmp_path):
+    """Verify the 7 core security assertions for ReceiptReplayLedger:
+    1. Forged HMAC signature with unique Receipt ID is rejected (never VERIFIED/TRUSTED).
+    2. Valid signature but missing raw content yields SIGNATURE_VERIFIED, is_trusted=False.
+    3. Valid content hash but missing secret_key yields CONTENT_VERIFIED, is_trusted=False.
+    4. Neither secret_key nor raw_content yields REPLAY_ACCEPTED, is_trusted=False.
+    5. Valid signature but replaced content yields REJECTED_CONTENT_HASH_MISMATCH, is_trusted=False.
+    6. Cross-run / cross-target reuse is strictly blocked.
+    7. Revoked key is rejected even if HMAC and content match.
+    8. Offline fixture masquerading is rejected with is_trusted=False.
+    """
+    db_path = tmp_path / "replay_matrix.db"
+    ledger = ReceiptReplayLedger(db_path=db_path)
+    secret_key = b"replay-matrix-secret-key-32b"
+    raw_content = b"<html>Evidence Content for Matrix Test</html>"
+
+    # 1. Forged HMAC signature but unique Receipt ID -> rejected signature mismatch
+    forged_receipt = CollectorReceipt(
+        receipt_id="rcp_forged_unique_001",
+        kind=ReceiptKind.TRUSTED_COLLECTOR_RECEIPT.value,
+        run_id="run-matrix-1",
+        collector_id="collector-matrix",
+        collected_url="https://example.com/target",
+        collected_at="2026-10-24T00:00:00Z",
+        content_sha256=compute_content_sha256(raw_content),
+        permit_ref="permit-001",
+        policy_decision_ref="ALLOW",
+        target_id="target-001",
+        signature="COMPLETELY_FORGED_HMAC_SIGNATURE_HEX",
+        key_id="matrix-key-v1",
+    )
+    res_forged = ledger.check_and_record_receipt(
+        forged_receipt,
+        expected_run_id="run-matrix-1",
+        expected_target_id="target-001",
+        secret_key=secret_key,
+        raw_content_bytes=raw_content,
+    )
+    assert res_forged.is_trusted is False
+    assert res_forged.status == ReceiptValidationStatus.REJECTED_SIGNATURE_MISMATCH
+    assert res_forged.signature_verified is False
+    assert res_forged.replay_accepted is False
+
+    # 2. Genuine receipt signed at collector boundary
+    valid_receipt = sign_collector_receipt(
+        run_id="run-matrix-1",
+        collector_id="collector-matrix",
+        collected_url="https://example.com/target",
+        raw_content_bytes=raw_content,
+        permit_ref="permit-001",
+        policy_decision_ref="ALLOW",
+        secret_key=secret_key,
+        target_id="target-001",
+        key_id="matrix-key-v1",
+    )
+
+    # 2a. Unverified import without secret_key or raw_content -> REPLAY_ACCEPTED, is_trusted=False
+    ledger_unverified = ReceiptReplayLedger(db_path=tmp_path / "unverified.db")
+    res_unverified = ledger_unverified.check_and_record_receipt(
+        valid_receipt,
+        expected_run_id="run-matrix-1",
+        expected_target_id="target-001",
+    )
+    assert res_unverified.is_trusted is False
+    assert res_unverified.status == ReceiptValidationStatus.REPLAY_ACCEPTED
+    assert res_unverified.replay_accepted is True
+    assert res_unverified.signature_verified is False
+    assert res_unverified.content_verified is False
+
+    # 2b. Signature verified but raw content missing -> SIGNATURE_VERIFIED, is_trusted=False
+    ledger_sig_only = ReceiptReplayLedger(db_path=tmp_path / "sig_only.db")
+    res_sig_only = ledger_sig_only.check_and_record_receipt(
+        valid_receipt,
+        expected_run_id="run-matrix-1",
+        expected_target_id="target-001",
+        secret_key=secret_key,
+        raw_content_bytes=None,
+    )
+    assert res_sig_only.is_trusted is False
+    assert res_sig_only.status == ReceiptValidationStatus.SIGNATURE_VERIFIED
+    assert res_sig_only.signature_verified is True
+    assert res_sig_only.content_verified is False
+    assert res_sig_only.replay_accepted is True
+
+    # 2c. Content hash verified but secret_key missing -> CONTENT_VERIFIED, is_trusted=False
+    ledger_content_only = ReceiptReplayLedger(db_path=tmp_path / "content_only.db")
+    res_content_only = ledger_content_only.check_and_record_receipt(
+        valid_receipt,
+        expected_run_id="run-matrix-1",
+        expected_target_id="target-001",
+        secret_key=None,
+        raw_content_bytes=raw_content,
+    )
+    assert res_content_only.is_trusted is False
+    assert res_content_only.status == ReceiptValidationStatus.CONTENT_VERIFIED
+    assert res_content_only.content_verified is True
+    assert res_content_only.signature_verified is False
+    assert res_content_only.replay_accepted is True
+
+    # 2d. Replaced/Tampered content with valid signature -> REJECTED_CONTENT_HASH_MISMATCH
+    tampered_content = b"<html>Tampered Replaced Content</html>"
+    ledger_tampered = ReceiptReplayLedger(db_path=tmp_path / "tampered.db")
+    res_tampered = ledger_tampered.check_and_record_receipt(
+        valid_receipt,
+        expected_run_id="run-matrix-1",
+        expected_target_id="target-001",
+        secret_key=secret_key,
+        raw_content_bytes=tampered_content,
+    )
+    assert res_tampered.is_trusted is False
+    assert res_tampered.status == ReceiptValidationStatus.REJECTED_CONTENT_HASH_MISMATCH
+    assert res_tampered.replay_accepted is False
+
+    # 2e. Revoked key -> REJECTED_KEY_REVOKED_OR_INACTIVE
+    ledger_revoked = ReceiptReplayLedger(
+        db_path=tmp_path / "revoked.db",
+        revoked_key_ids={"matrix-key-v1"},
+    )
+    res_revoked = ledger_revoked.check_and_record_receipt(
+        valid_receipt,
+        expected_run_id="run-matrix-1",
+        expected_target_id="target-001",
+        secret_key=secret_key,
+        raw_content_bytes=raw_content,
+    )
+    assert res_revoked.is_trusted is False
+    assert res_revoked.status == ReceiptValidationStatus.REJECTED_KEY_REVOKED_OR_INACTIVE
+    assert res_revoked.replay_accepted is False
+
+    # 2f. Offline fixture masquerading as live collection receipt -> OFFLINE_FIXTURE_ACKNOWLEDGED, is_trusted=False
+    offline_fixture = CollectorReceipt(
+        receipt_id="rcp_fixture_fake_001",
+        kind=ReceiptKind.OFFLINE_FIXTURE.value,
+        run_id="run-matrix-1",
+        collector_id="collector-fixture",
+        collected_url="https://example.com/target",
+        collected_at="2026-10-24T00:00:00Z",
+        content_sha256=compute_content_sha256(raw_content),
+        permit_ref="permit-001",
+        policy_decision_ref="ALLOW",
+        target_id="target-001",
+        signature="any-sig",
+        key_id="matrix-key-v1",
+    )
+    res_fixture = ledger.check_and_record_receipt(
+        offline_fixture,
+        expected_run_id="run-matrix-1",
+        expected_target_id="target-001",
+        secret_key=secret_key,
+        raw_content_bytes=raw_content,
+    )
+    assert res_fixture.is_trusted is False
+    assert res_fixture.status == ReceiptValidationStatus.OFFLINE_FIXTURE_ACKNOWLEDGED
+    assert res_fixture.replay_accepted is False
+
+
+# ── 17. Receipt Replay Ledger: Concurrent Processes Competing for Same Receipt ──
+def test_two_processes_competing_to_consume_same_receipt_atomically(tmp_path):
+    """Verify that SQLite BEGIN IMMEDIATE guarantees atomic once-and-only-once receipt consumption across processes."""
+    db_path = tmp_path / "receipt_race.db"
+    secret_key = b"race-test-secret-key-32b"
+    raw_content = b"<html>Concurrent Process Race Test Content</html>"
+
+    receipt = sign_collector_receipt(
+        run_id="run-race-proc",
+        collector_id="collector-race",
+        collected_url="https://target.com/race",
+        raw_content_bytes=raw_content,
+        permit_ref="permit-race-1",
+        policy_decision_ref="ALLOW",
+        secret_key=secret_key,
+        target_id="target-race-1",
+        key_id="race-key-v1",
+    )
+
+    q = mp.Queue()
+    processes = [
+        mp.Process(
+            target=_worker_consume_receipt_race,
+            args=(
+                str(db_path),
+                receipt.to_dict(),
+                "run-race-proc",
+                "target-race-1",
+                secret_key,
+                raw_content,
+                q,
+            ),
+        )
+        for _ in range(4)
+    ]
+
+    for p in processes:
+        p.start()
+    for p in processes:
+        p.join(timeout=10.0)
+
+    results = [q.get(timeout=2.0) for _ in range(4)]
+    successes = [r for r in results if r[0] == "VERIFIED" and r[1] is True]
+    duplicates = [r for r in results if r[0] == "REJECTED_REPLAY_DUPLICATE_IMPORT"]
+    exceptions = [r for r in results if r[0] == "EXCEPTION"]
+
+    assert len(exceptions) == 0, f"Unexpected worker exceptions: {exceptions}"
+    assert len(successes) == 1, f"Expected exactly 1 process to successfully consume the receipt, got {len(successes)}"
+    assert len(duplicates) == 3, f"Expected exactly 3 processes to be rejected as duplicate import, got {len(duplicates)}"

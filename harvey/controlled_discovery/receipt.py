@@ -23,6 +23,7 @@ import hmac
 import json
 import sqlite3
 import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -41,6 +42,9 @@ CANONICAL_SCHEMA_VERSION = "harvey-receipt-v2"
 
 class ReceiptValidationStatus(str, Enum):
     VERIFIED = "VERIFIED"
+    SIGNATURE_VERIFIED = "SIGNATURE_VERIFIED"
+    CONTENT_VERIFIED = "CONTENT_VERIFIED"
+    REPLAY_ACCEPTED = "REPLAY_ACCEPTED"
     REJECTED_SIGNATURE_MISMATCH = "REJECTED_SIGNATURE_MISMATCH"
     REJECTED_CONTENT_HASH_MISMATCH = "REJECTED_CONTENT_HASH_MISMATCH"
     REJECTED_MISSING_FIELDS = "REJECTED_MISSING_FIELDS"
@@ -108,6 +112,8 @@ class ReceiptValidationResult:
     reason: str
     computed_content_sha256: str = ""
     content_verified: bool = False
+    signature_verified: bool = False
+    replay_accepted: bool = False
 
 
 def compute_content_sha256(raw_bytes: bytes) -> str:
@@ -331,6 +337,17 @@ def verify_collector_receipt(
             reason="HMAC signature verification failed (tampered receipt or invalid key)",
             computed_content_sha256=computed_sha,
             content_verified=False,
+            signature_verified=False,
+        )
+
+    if not content_is_verified:
+        return ReceiptValidationResult(
+            is_trusted=False,
+            status=ReceiptValidationStatus.SIGNATURE_VERIFIED,
+            reason="HMAC signature verified successfully, but raw content not provided for verification",
+            computed_content_sha256=computed_sha,
+            content_verified=False,
+            signature_verified=True,
         )
 
     return ReceiptValidationResult(
@@ -339,6 +356,7 @@ def verify_collector_receipt(
         reason="Cryptographic receipt verified successfully",
         computed_content_sha256=computed_sha,
         content_verified=content_is_verified,
+        signature_verified=True,
     )
 
 
@@ -349,18 +367,33 @@ class ReceiptReplayLedger:
     - Enforces receipt uniqueness (blocks duplicate receipt import).
     - Binds receipt to specific expected run_id (blocks cross-run reuse).
     - Binds receipt to specific expected target_id (blocks cross-target reuse).
+    - Executes cryptographic verification and content verification atomically within BEGIN IMMEDIATE.
+    - Fail-closed: unverified receipts are never marked VERIFIED or is_trusted=True.
     """
 
-    def __init__(self, db_path: str | Path):
+    def __init__(
+        self,
+        db_path: str | Path,
+        secret_key: Optional[Union[bytes, str]] = None,
+        active_key_ids: Optional[Set[str]] = None,
+        revoked_key_ids: Optional[Set[str]] = None,
+    ):
         self.db_path = str(db_path)
+        self.secret_key = secret_key
+        self.active_key_ids = active_key_ids
+        self.revoked_key_ids = revoked_key_ids
         self._init_db()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self):
         conn = sqlite3.connect(self.db_path, timeout=30.0, isolation_level=None)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=30000")
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            yield conn
+        finally:
+            conn.close()
 
     def _init_db(self) -> None:
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -392,19 +425,45 @@ class ReceiptReplayLedger:
         receipt: CollectorReceipt,
         expected_run_id: Optional[str] = None,
         expected_target_id: Optional[str] = None,
+        secret_key: Optional[Union[bytes, str]] = None,
+        raw_content_bytes: Optional[bytes] = None,
+        active_key_ids: Optional[Set[str]] = None,
+        revoked_key_ids: Optional[Set[str]] = None,
     ) -> ReceiptValidationResult:
-        """Verify replay constraints and record receipt into the local ledger.
+        """Verify replay constraints, cryptographic signature, and content matching,
+        then atomically record receipt into the local ledger.
 
         Checks:
         1. Cross-run reuse: if expected_run_id is supplied, receipt.run_id must match.
         2. Cross-target reuse: if expected_target_id is supplied and receipt has target_id, it must match.
-        3. Duplicate import: receipt_id must not already exist in the ledger.
+        3. Atomic BEGIN IMMEDIATE transaction:
+           - Duplicate import: receipt_id must not already exist in the ledger.
+           - Kind discrimination: OFFLINE_FIXTURE, UNTRUSTED_IMPORTED_BUNDLE rejected.
+           - Key status: check active_key_ids and revoked_key_ids.
+           - Essential fields validation.
+           - Content SHA-256 validation against raw_content_bytes.
+           - HMAC signature verification against secret_key.
+           - Insert into imported_receipts table.
+        4. State discrimination:
+           - VERIFIED & is_trusted=True ONLY if HMAC + content + key + replay all pass.
+           - SIGNATURE_VERIFIED & is_trusted=False if signature valid but raw content missing.
+           - CONTENT_VERIFIED & is_trusted=False if content hash valid but signature unverified.
+           - REPLAY_ACCEPTED & is_trusted=False if only replay checked without cryptographic key.
         """
+        effective_key = secret_key if secret_key is not None else self.secret_key
+        effective_active_keys = (
+            active_key_ids if active_key_ids is not None else self.active_key_ids
+        )
+        effective_revoked_keys = (
+            revoked_key_ids if revoked_key_ids is not None else self.revoked_key_ids
+        )
+
         if expected_run_id and receipt.run_id != expected_run_id:
             return ReceiptValidationResult(
                 is_trusted=False,
                 status=ReceiptValidationStatus.REJECTED_REPLAY_RUN_MISMATCH,
                 reason=f"Cross-run reuse detected: receipt.run_id '{receipt.run_id}' != expected '{expected_run_id}'",
+                replay_accepted=False,
             )
 
         if (
@@ -416,6 +475,7 @@ class ReceiptReplayLedger:
                 is_trusted=False,
                 status=ReceiptValidationStatus.REJECTED_REPLAY_TARGET_MISMATCH,
                 reason=f"Cross-target reuse detected: receipt.target_id '{receipt.target_id}' != expected '{expected_target_id}'",
+                replay_accepted=False,
             )
 
         now_ts = datetime.now(timezone.utc).isoformat()
@@ -433,8 +493,133 @@ class ReceiptReplayLedger:
                         is_trusted=False,
                         status=ReceiptValidationStatus.REJECTED_REPLAY_DUPLICATE_IMPORT,
                         reason=f"Duplicate receipt import rejected: receipt_id '{receipt.receipt_id}' was already imported in run '{existing['run_id']}'",
+                        replay_accepted=False,
                     )
 
+                # 1. Kind discrimination
+                if receipt.kind == ReceiptKind.OFFLINE_FIXTURE.value:
+                    conn.execute("ROLLBACK")
+                    return ReceiptValidationResult(
+                        is_trusted=False,
+                        status=ReceiptValidationStatus.OFFLINE_FIXTURE_ACKNOWLEDGED,
+                        reason="Receipt is an offline fixture; cannot masquerade as trusted live collection",
+                        replay_accepted=False,
+                    )
+
+                if receipt.kind == ReceiptKind.UNTRUSTED_IMPORTED_BUNDLE.value:
+                    conn.execute("ROLLBACK")
+                    return ReceiptValidationResult(
+                        is_trusted=False,
+                        status=ReceiptValidationStatus.UNTRUSTED_BUNDLE_UNVERIFIED,
+                        reason="Receipt is an untrusted imported bundle; zero trust assumption",
+                        replay_accepted=False,
+                    )
+
+                if receipt.kind != ReceiptKind.TRUSTED_COLLECTOR_RECEIPT.value:
+                    conn.execute("ROLLBACK")
+                    return ReceiptValidationResult(
+                        is_trusted=False,
+                        status=ReceiptValidationStatus.REJECTED_INVALID_KIND,
+                        reason=f"Unknown receipt kind: {receipt.kind}",
+                        replay_accepted=False,
+                    )
+
+                # 2. Key status enforcement
+                if effective_revoked_keys and receipt.key_id in effective_revoked_keys:
+                    conn.execute("ROLLBACK")
+                    return ReceiptValidationResult(
+                        is_trusted=False,
+                        status=ReceiptValidationStatus.REJECTED_KEY_REVOKED_OR_INACTIVE,
+                        reason=f"Key {receipt.key_id} is revoked",
+                        replay_accepted=False,
+                    )
+                if (
+                    effective_active_keys is not None
+                    and receipt.key_id not in effective_active_keys
+                ):
+                    conn.execute("ROLLBACK")
+                    return ReceiptValidationResult(
+                        is_trusted=False,
+                        status=ReceiptValidationStatus.REJECTED_KEY_REVOKED_OR_INACTIVE,
+                        reason=f"Key {receipt.key_id} is not in active key set",
+                        replay_accepted=False,
+                    )
+
+                # 3. Required fields check
+                if (
+                    not receipt.receipt_id
+                    or not receipt.run_id
+                    or not receipt.collector_id
+                    or not receipt.collected_url
+                    or not receipt.content_sha256
+                    or not receipt.permit_ref
+                    or not receipt.policy_decision_ref
+                    or not receipt.signature
+                    or not receipt.key_id
+                ):
+                    conn.execute("ROLLBACK")
+                    return ReceiptValidationResult(
+                        is_trusted=False,
+                        status=ReceiptValidationStatus.REJECTED_MISSING_FIELDS,
+                        reason="Required receipt fields missing or empty",
+                        replay_accepted=False,
+                    )
+
+                # 4. Content SHA-256 verification if raw bytes provided
+                computed_sha = ""
+                content_verified = False
+                if raw_content_bytes is not None:
+                    computed_sha = compute_content_sha256(raw_content_bytes)
+                    if computed_sha.lower() != receipt.content_sha256.strip().lower():
+                        conn.execute("ROLLBACK")
+                        return ReceiptValidationResult(
+                            is_trusted=False,
+                            status=ReceiptValidationStatus.REJECTED_CONTENT_HASH_MISMATCH,
+                            reason=f"Raw content SHA256 {computed_sha} does not match receipt SHA256 {receipt.content_sha256}",
+                            computed_content_sha256=computed_sha,
+                            content_verified=False,
+                            replay_accepted=False,
+                        )
+                    content_verified = True
+
+                # 5. Cryptographic HMAC signature verification if key is provided
+                signature_verified = False
+                if effective_key is not None:
+                    key_bytes = (
+                        effective_key.encode("utf-8")
+                        if isinstance(effective_key, str)
+                        else effective_key
+                    )
+                    payload = _canonical_signing_string(
+                        receipt_id=receipt.receipt_id,
+                        kind=receipt.kind,
+                        run_id=receipt.run_id,
+                        collector_id=receipt.collector_id,
+                        collected_url=receipt.collected_url,
+                        collected_at=receipt.collected_at,
+                        content_sha256=receipt.content_sha256,
+                        permit_ref=receipt.permit_ref,
+                        policy_decision_ref=receipt.policy_decision_ref,
+                        key_id=receipt.key_id,
+                        target_id=receipt.target_id,
+                    )
+                    expected_sig = hmac.new(
+                        key_bytes, payload, hashlib.sha256
+                    ).hexdigest()
+                    if not hmac.compare_digest(expected_sig, receipt.signature):
+                        conn.execute("ROLLBACK")
+                        return ReceiptValidationResult(
+                            is_trusted=False,
+                            status=ReceiptValidationStatus.REJECTED_SIGNATURE_MISMATCH,
+                            reason="HMAC signature verification failed (tampered receipt or invalid key)",
+                            computed_content_sha256=computed_sha,
+                            content_verified=content_verified,
+                            signature_verified=False,
+                            replay_accepted=False,
+                        )
+                    signature_verified = True
+
+                # 6. Insert into replay ledger
                 conn.execute(
                     """
                     INSERT INTO imported_receipts (
@@ -453,11 +638,48 @@ class ReceiptReplayLedger:
                     ),
                 )
                 conn.execute("COMMIT")
-                return ReceiptValidationResult(
-                    is_trusted=True,
-                    status=ReceiptValidationStatus.VERIFIED,
-                    reason="Receipt successfully recorded with no replay violations",
-                )
+
+                # 7. Discriminate state: all conditions must be met for VERIFIED / TRUSTED
+                if signature_verified and content_verified:
+                    return ReceiptValidationResult(
+                        is_trusted=True,
+                        status=ReceiptValidationStatus.VERIFIED,
+                        reason="Cryptographic signature, content hash, and replay constraints all verified successfully",
+                        computed_content_sha256=computed_sha,
+                        content_verified=True,
+                        signature_verified=True,
+                        replay_accepted=True,
+                    )
+                elif signature_verified and not content_verified:
+                    return ReceiptValidationResult(
+                        is_trusted=False,
+                        status=ReceiptValidationStatus.SIGNATURE_VERIFIED,
+                        reason="Signature verified and replay recorded, but content unverified (no raw content bytes provided)",
+                        computed_content_sha256=computed_sha,
+                        content_verified=False,
+                        signature_verified=True,
+                        replay_accepted=True,
+                    )
+                elif not signature_verified and content_verified:
+                    return ReceiptValidationResult(
+                        is_trusted=False,
+                        status=ReceiptValidationStatus.CONTENT_VERIFIED,
+                        reason="Content hash verified and replay recorded, but signature unverified (no secret key provided)",
+                        computed_content_sha256=computed_sha,
+                        content_verified=True,
+                        signature_verified=False,
+                        replay_accepted=True,
+                    )
+                else:
+                    return ReceiptValidationResult(
+                        is_trusted=False,
+                        status=ReceiptValidationStatus.REPLAY_ACCEPTED,
+                        reason="Receipt recorded in replay ledger, but unverified cryptographically (no secret key provided)",
+                        computed_content_sha256=computed_sha,
+                        content_verified=False,
+                        signature_verified=False,
+                        replay_accepted=True,
+                    )
             except Exception:
                 conn.execute("ROLLBACK")
                 raise

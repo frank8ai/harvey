@@ -34,16 +34,24 @@
   - 使用 `json.dumps(..., sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")`，保证键名严格排序、剔除空白、类型明确且跨平台字节序列完全确定。
   - 增加 `target_id` 显式字段绑定，确保签名与验签使用严格同一字节流。
 
-### B. 采集回执业务防重放闭环 (SEC-REPLAY-01)
-明确签名真实性（密码学有效性）与业务防重放（Business Replay Defense）是正交的两个控制维度：
-- **存储介质**：复用轻量级 SQLite (`imported_receipts` 表，WAL 模式 + `BEGIN IMMEDIATE` 排他锁)，不引入大型复杂 PKI 系统。
-- **正向与负向防御矩阵**：
+### B. 采集回执业务防重放与可信性门禁闭环 (SEC-REPLAY-01 & W1-05-C-R2)
+明确签名真实性（密码学有效性）、正文匹配性与防重放约束是三个正交控制维度：
+- **状态细分与状态机隔离**：
+  在 `ReceiptValidationStatus` 中明确扩充 `SIGNATURE_VERIFIED`、`CONTENT_VERIFIED`、`REPLAY_ACCEPTED`，区分三种正交状态。
+- **严格 Fail-Closed 可信裁决**：
+  未验签的 Receipt 绝不得被 ReplayLedger 标记为 `VERIFIED` 或 `is_trusted=True`。只有同时满足 **HMAC 正确 (`SIGNATURE_VERIFIED`) + 正文匹配 (`CONTENT_VERIFIED`) + Key 未撤销有效 + Run/Target 匹配 + 账本唯一导入消费 (`REPLAY_ACCEPTED`)** 时，才允许返回 `is_trusted=True` 和 `status=VERIFIED`。若未注入密钥，即使防重放检查通过，状态也只能是 `REPLAY_ACCEPTED`，且 `is_trusted=False`。
+- **原子事务防竞态与双重消费**：
+  在 `ReceiptReplayLedger.check_and_record_receipt()` 内，使用 SQLite `BEGIN IMMEDIATE` 排他互斥事务，将“防重放检查 -> 密钥状态校验 -> 正文哈希比对 -> 密码学 HMAC 验签 -> 写入账本”闭环在单一原子事务中，彻底消除验签与写入之间的并发竞争 (TOCTOU) 与并发双重消费漏洞。
+- **资源生命周期管控**：
+  在 Windows 环境下使用显式上下文管理器确保 `conn.close()` 执行，杜绝跨进程或单测清理临时目录时的 `WinError 32` 文件占用异常。
+- **存储介质与防御矩阵**：
+  复用轻量级 SQLite (`imported_receipts` 表，WAL 模式 + `BEGIN IMMEDIATE` 排他锁)，不引入大型复杂 PKI 系统：
   1. **同一 Receipt 重复导入**：`receipt_id PRIMARY KEY` 约束，首发导入成功，二次导入即报 `REJECTED_REPLAY_DUPLICATE_IMPORT`。
   2. **跨 Run 复用拦截**：比对 `receipt.run_id` 与预期的 `expected_run_id`，不匹配报 `REJECTED_REPLAY_RUN_MISMATCH`。
   3. **跨 Target 复用拦截**：比对 `receipt.target_id` 与预期的 `expected_target_id`，不匹配报 `REJECTED_REPLAY_TARGET_MISMATCH`。
   4. **Key 状态生命周期**：验签接口支持 `active_key_ids` 白名单与 `revoked_key_ids` 黑名单，已失效/撤销的 Key 立即报 `REJECTED_KEY_REVOKED_OR_INACTIVE`。
   5. **字段篡改阻断**：任何修改 `collector_id`、`collected_url`、`collected_at`、`permit_ref` 或 `target_id` 的行为均导致 HMAC 签名校验失败。
-  6. **伪造 verified 声明拦截**：`from_dict()` 强制过滤 `verified` 字段，且 `verify_collector_receipt` 只根据公钥/私钥 HMAC 运算结果生成 `is_trusted`。
+  6. **伪造 verified 声明拦截**：`from_dict()` 强制过滤 `verified` 字段，且验签只根据公钥/私钥 HMAC 运算结果生成 `is_trusted`。
   7. **正文核实断言隔离**：当未提供 `raw_content_bytes` 时，`content_verified` 严格置为 `False`；若调用方声明 `require_content_reverification=True`，直接拒绝并报 `REJECTED_CONTENT_MISSING`，绝对不向外假称内容已重新核实。
 
 ### C. UTC 每日预算跨日计量 (FIN-TIME-01)
@@ -77,14 +85,16 @@
 | 13 | `test_receipt_replay_prevention_and_lifecycle` | 重复导入、跨Run、跨Target、密钥吊销与字段篡改 | 严格触发对应拒绝状态，正文缺失不能假称核实 | **PASSED** |
 | 14 | `test_utc_daily_budget_accounting_across_timezones` | 跨时区 UTC 日边界配额统计 | 严格按 UTC 日期归集，不受本地时区偏移干扰 | **PASSED** |
 | 15 | `test_unknown_and_negative_cost_fail_closed` | 预留或结算传入负数成本 | 拦截负数成本，杜绝配额倒退与非法套利 | **PASSED** |
+| 16 | `test_replay_ledger_cryptographic_and_content_verification_matrix` | 伪造签名但唯一 ID、正确签名但无正文/无密钥、正文篡改、已撤销 Key、离线 Fixture 伪装 | 伪造签名被拒；仅验签无正文 `SIGNATURE_VERIFIED` (is_trusted=False)；仅验正文无密钥 `CONTENT_VERIFIED` (is_trusted=False)；未提供密钥 `REPLAY_ACCEPTED` (is_trusted=False)；篡改正文哈希不匹配；已撤销 Key 被拒；离线 Fixture 严禁伪装可信 | **PASSED** |
+| 17 | `test_two_processes_competing_to_consume_same_receipt_atomically` | 4个并发独立进程争抢消费同一张合法可信回执 | 恰好1个成功入账 (`VERIFIED`, is_trusted=True)，其余3个进程原子互斥拦截 (`REJECTED_REPLAY_DUPLICATE_IMPORT`) | **PASSED** |
 
 **专项与全量回归测试集状态**：
-- `test_w105_budget_audit.py`：15 passed in 3.73s
+- `test_w105_budget_audit.py`：17 passed in 3.40s
 - `test_w1_02_safety_hardening.py`：21 passed
 - `test_devtools_signals.py`：3 passed
 - `test_devtools_collector.py`：23 passed
 - `test_devtools_pipeline_e2e.py`：6 passed
-- **合计 68 passed in 63.22s (100% 绿灯，零回归失败)**
+- **合计 70 passed in 63.85s (100% 绿灯，零回归失败)**
 
 ---
 
