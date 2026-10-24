@@ -41,6 +41,7 @@ from harvey.controlled_discovery.audit import (
 from harvey.controlled_discovery.receipt import (
     CollectorReceipt,
     ReceiptKind,
+    ReceiptReplayLedger,
     ReceiptValidationStatus,
     compute_content_sha256,
     sign_collector_receipt,
@@ -457,3 +458,291 @@ def test_unknown_pricing_defaults_to_forbidden(tmp_path):
                 reserved_cost_usd=-1.0,
             )
         )
+
+
+# ── 12. HMAC Canonical String: Delimiter Collision Red-before-Green ────────
+def test_hmac_canonical_string_delimiter_collision_prevented():
+    """Demonstrate that different field values with delimiters produce distinct signatures.
+
+    Red-before-Green: Under pipe-delimited encoding, run_id='run-1' and collector_id='col|extra'
+    collided identically with run_id='run-1|col' and collector_id='extra'.
+    Under versioned canonical JSON encoding, the two signatures are guaranteed distinct.
+    """
+    secret_key = b"collision-test-key-32b"
+    raw_content = b"<html>test content</html>"
+
+    # Candidate A: run_id='r1', collector_id='col|extra'
+    rA = sign_collector_receipt(
+        run_id="r1",
+        collector_id="col|extra",
+        collected_url="https://example.com/a",
+        raw_content_bytes=raw_content,
+        permit_ref="permit-1",
+        policy_decision_ref="ALLOW",
+        secret_key=secret_key,
+        receipt_id="rcp_delim_01",
+        collected_at="2026-10-21T00:00:00Z",
+        key_id="k1",
+    )
+
+    # Candidate B: run_id='r1|col', collector_id='extra' (collision attempt)
+    rB = sign_collector_receipt(
+        run_id="r1|col",
+        collector_id="extra",
+        collected_url="https://example.com/a",
+        raw_content_bytes=raw_content,
+        permit_ref="permit-1",
+        policy_decision_ref="ALLOW",
+        secret_key=secret_key,
+        receipt_id="rcp_delim_01",
+        collected_at="2026-10-21T00:00:00Z",
+        key_id="k1",
+    )
+
+    # In canonical JSON, rA and rB MUST NOT have identical signatures
+    assert rA.signature != rB.signature, "Signatures must not collide across delimiter boundaries"
+
+    # Verify both signatures are valid against their own canonical representations
+    vA = verify_collector_receipt(rA, secret_key=secret_key, raw_content_bytes=raw_content)
+    vB = verify_collector_receipt(rB, secret_key=secret_key, raw_content_bytes=raw_content)
+    assert vA.is_trusted is True
+    assert vB.is_trusted is True
+
+
+# ── 13. Receipt Replay Defenses: Duplicate, Cross-Run, Cross-Target ─────────
+def test_receipt_replay_prevention_and_lifecycle(tmp_path):
+    """Verify business-level replay defense: duplicate import, cross-run, cross-target, and revoked keys."""
+    db_path = tmp_path / "receipt_replay.db"
+    replay_ledger = ReceiptReplayLedger(db_path=db_path)
+    secret_key = b"replay-test-key-32b"
+    raw_content = b"<html>Receipt Replay Defense Test</html>"
+
+    receipt1 = sign_collector_receipt(
+        run_id="run-alpha",
+        collector_id="collector-main",
+        collected_url="https://target1.com/pricing",
+        raw_content_bytes=raw_content,
+        permit_ref="permit-alpha-1",
+        policy_decision_ref="ALLOW",
+        secret_key=secret_key,
+        target_id="target-corp-1",
+        key_id="key-active-v1",
+    )
+
+    # 1. First import succeeds
+    res1 = replay_ledger.check_and_record_receipt(
+        receipt1,
+        expected_run_id="run-alpha",
+        expected_target_id="target-corp-1",
+    )
+    assert res1.is_trusted is True
+    assert res1.status == ReceiptValidationStatus.VERIFIED
+
+    # 2. Duplicate import in same run is blocked
+    res_dup = replay_ledger.check_and_record_receipt(
+        receipt1,
+        expected_run_id="run-alpha",
+        expected_target_id="target-corp-1",
+    )
+    assert res_dup.is_trusted is False
+    assert res_dup.status == ReceiptValidationStatus.REJECTED_REPLAY_DUPLICATE_IMPORT
+
+    # 3. Cross-run reuse attempt is blocked
+    res_cross_run = replay_ledger.check_and_record_receipt(
+        receipt1,
+        expected_run_id="run-beta",
+        expected_target_id="target-corp-1",
+    )
+    assert res_cross_run.is_trusted is False
+    assert res_cross_run.status == ReceiptValidationStatus.REJECTED_REPLAY_RUN_MISMATCH
+
+    # 4. Cross-target reuse attempt is blocked
+    receipt_target2 = sign_collector_receipt(
+        run_id="run-gamma",
+        collector_id="collector-main",
+        collected_url="https://target1.com/pricing",
+        raw_content_bytes=raw_content,
+        permit_ref="permit-gamma-1",
+        policy_decision_ref="ALLOW",
+        secret_key=secret_key,
+        target_id="target-corp-1",
+        key_id="key-active-v1",
+    )
+    res_cross_target = replay_ledger.check_and_record_receipt(
+        receipt_target2,
+        expected_run_id="run-gamma",
+        expected_target_id="target-corp-2",  # Expected target is corp-2, but receipt is bound to corp-1
+    )
+    assert res_cross_target.is_trusted is False
+    assert res_cross_target.status == ReceiptValidationStatus.REJECTED_REPLAY_TARGET_MISMATCH
+
+    # 5. Revoked and inactive keys are rejected
+    v_revoked = verify_collector_receipt(
+        receipt1,
+        secret_key=secret_key,
+        raw_content_bytes=raw_content,
+        revoked_key_ids={"key-active-v1"},
+    )
+    assert v_revoked.is_trusted is False
+    assert v_revoked.status == ReceiptValidationStatus.REJECTED_KEY_REVOKED_OR_INACTIVE
+
+    v_inactive = verify_collector_receipt(
+        receipt1,
+        secret_key=secret_key,
+        raw_content_bytes=raw_content,
+        active_key_ids={"other-key-v2"},
+    )
+    assert v_inactive.is_trusted is False
+    assert v_inactive.status == ReceiptValidationStatus.REJECTED_KEY_REVOKED_OR_INACTIVE
+
+    # 6. Tampering with any signed field (collector_id, url, time, permit) fails signature
+    tampered_url_receipt = CollectorReceipt(
+        receipt_id=receipt1.receipt_id,
+        kind=receipt1.kind,
+        run_id=receipt1.run_id,
+        collector_id=receipt1.collector_id,
+        collected_url="https://malicious-redirect.com",  # Modified URL
+        collected_at=receipt1.collected_at,
+        content_sha256=receipt1.content_sha256,
+        permit_ref=receipt1.permit_ref,
+        policy_decision_ref=receipt1.policy_decision_ref,
+        target_id=receipt1.target_id,
+        signature=receipt1.signature,
+        key_id=receipt1.key_id,
+    )
+    assert verify_collector_receipt(tampered_url_receipt, secret_key=secret_key).is_trusted is False
+
+    tampered_time_receipt = CollectorReceipt(
+        receipt_id=receipt1.receipt_id,
+        kind=receipt1.kind,
+        run_id=receipt1.run_id,
+        collector_id=receipt1.collector_id,
+        collected_url=receipt1.collected_url,
+        collected_at="2025-01-01T00:00:00Z",  # Modified timestamp
+        content_sha256=receipt1.content_sha256,
+        permit_ref=receipt1.permit_ref,
+        policy_decision_ref=receipt1.policy_decision_ref,
+        target_id=receipt1.target_id,
+        signature=receipt1.signature,
+        key_id=receipt1.key_id,
+    )
+    assert verify_collector_receipt(tampered_time_receipt, secret_key=secret_key).is_trusted is False
+
+    tampered_permit_receipt = CollectorReceipt(
+        receipt_id=receipt1.receipt_id,
+        kind=receipt1.kind,
+        run_id=receipt1.run_id,
+        collector_id=receipt1.collector_id,
+        collected_url=receipt1.collected_url,
+        collected_at=receipt1.collected_at,
+        content_sha256=receipt1.content_sha256,
+        permit_ref="fake-permit-999",  # Modified permit
+        policy_decision_ref=receipt1.policy_decision_ref,
+        target_id=receipt1.target_id,
+        signature=receipt1.signature,
+        key_id=receipt1.key_id,
+    )
+    assert verify_collector_receipt(tampered_permit_receipt, secret_key=secret_key).is_trusted is False
+
+    # 7. Missing raw content cannot claim content reverification
+    v_no_bytes_req = verify_collector_receipt(
+        receipt1,
+        secret_key=secret_key,
+        raw_content_bytes=None,
+        require_content_reverification=True,
+    )
+    assert v_no_bytes_req.is_trusted is False
+    assert v_no_bytes_req.status == ReceiptValidationStatus.REJECTED_CONTENT_MISSING
+
+
+# ── 14. Hard Budget: UTC Day Boundary vs Local Timezones ───────────────────
+def test_utc_daily_budget_accounting_across_timezones(tmp_path, monkeypatch):
+    """Verify that daily budgets strictly track UTC calendar dates, unaffected by local time shifts."""
+    db_path = tmp_path / "utc_budget.db"
+    ledger = HardBudgetLedger(
+        db_path=db_path,
+        limits=BudgetLimits(authorized=True, max_daily_http_requests=5),
+    )
+
+    # Simulate UTC time at 23:30 on 2026-10-21 (which is 07:30 on 2026-10-22 in UTC+8)
+    from datetime import datetime, timezone
+    utc_night = datetime(2026, 10, 21, 23, 30, 0, tzinfo=timezone.utc)
+    utc_morning = datetime(2026, 10, 22, 0, 15, 0, tzinfo=timezone.utc)
+
+    # Reserve 5 requests on day 2026-10-21
+    import harvey.controlled_discovery.budget as budget_mod
+    monkeypatch.setattr(budget_mod, "_utcnow", lambda: utc_night.isoformat())
+    monkeypatch.setattr(budget_mod, "_today_str", lambda: utc_night.date().isoformat())
+
+    r1 = ledger.reserve(
+        ReservationRequest(
+            run_id="run-utc-1",
+            target_id="t1",
+            action_type="http_request",
+            reserved_http_requests=5,
+        )
+    )
+    assert r1.reserved_http_requests == 5
+
+    # 6th request on the same UTC day must fail closed
+    with pytest.raises(BudgetExceededError, match="Daily HTTP request budget exceeded"):
+        ledger.reserve(
+            ReservationRequest(
+                run_id="run-utc-1",
+                target_id="t2",
+                action_type="http_request",
+                reserved_http_requests=1,
+            )
+        )
+
+    # Next UTC day (00:15 on 2026-10-22): daily allowance resets in UTC
+    monkeypatch.setattr(budget_mod, "_utcnow", lambda: utc_morning.isoformat())
+    monkeypatch.setattr(budget_mod, "_today_str", lambda: utc_morning.date().isoformat())
+
+    r2 = ledger.reserve(
+        ReservationRequest(
+            run_id="run-utc-2",
+            target_id="t3",
+            action_type="http_request",
+            reserved_http_requests=3,
+        )
+    )
+    assert r2.reserved_http_requests == 3
+    assert ledger.get_daily_usage("2026-10-21") == 5
+    assert ledger.get_daily_usage("2026-10-22") == 3
+
+
+# ── 15. Hard Budget: Unknown / Negative Pricing Fail-Closed ─────────────────
+def test_unknown_and_negative_cost_fail_closed(tmp_path):
+    """Verify that negative settlement or negative reservations are strictly blocked."""
+    db_path = tmp_path / "pricing_failclosed.db"
+    ledger = HardBudgetLedger(
+        db_path=db_path,
+        limits=BudgetLimits(authorized=True, max_run_http_requests=10, max_model_cost_usd=5.0),
+    )
+
+    # Negative reservation is rejected
+    with pytest.raises(ValueError, match="negative"):
+        ledger.reserve(
+            ReservationRequest(
+                run_id="run-neg",
+                target_id="t1",
+                action_type="http_request",
+                reserved_cost_usd=-0.50,
+            )
+        )
+
+    # Valid reservation
+    r = ledger.reserve(
+        ReservationRequest(
+            run_id="run-neg",
+            target_id="t1",
+            action_type="http_request",
+            reserved_http_requests=2,
+            reserved_cost_usd=1.0,
+        )
+    )
+
+    # Settle with negative cost must fail closed
+    with pytest.raises(ValueError, match="cannot be negative"):
+        ledger.settle(r.reservation_id, status="success", actual_cost_usd=-1.0)
