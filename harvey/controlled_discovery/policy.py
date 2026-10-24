@@ -24,9 +24,9 @@ from enum import Enum
 import ipaddress
 import logging
 import re
-from typing import Callable, Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Set, Tuple
 import urllib.parse
-import urllib.robotparser
+import posixpath
 
 logger = logging.getLogger("harvey.controlled_discovery.policy")
 
@@ -194,6 +194,169 @@ class RedirectDecision:
     reason: str
 
 
+
+
+class RFC9309Rule:
+    """Individual Allow/Disallow rule conforming to RFC 9309 section 2.2.2."""
+
+    def __init__(self, is_allow: bool, pattern: str):
+        self.is_allow = is_allow
+        self.pattern = pattern
+        self.length = len(pattern)
+        if pattern:
+            pat = pattern if pattern.startswith("/") else "/" + pattern
+            has_end = pat.endswith("$")
+            clean_pat = pat[:-1] if has_end else pat
+            parts = clean_pat.split("*")
+            escaped_parts = [re.escape(part) for part in parts]
+            regex_str = "^" + ".*".join(escaped_parts)
+            if has_end:
+                regex_str += "$"
+            self._regex = re.compile(regex_str)
+        else:
+            self._regex = None
+
+    def matches(self, path: str) -> bool:
+        if not self.pattern or not self._regex:
+            return False
+        return bool(self._regex.match(path))
+
+
+class RFC9309Group:
+    """Group of rules associated with one or more User-Agents per RFC 9309."""
+
+    def __init__(self, user_agents: List[str]):
+        self.user_agents = [ua.strip().lower() for ua in user_agents if ua.strip()]
+        self.rules: List[RFC9309Rule] = []
+
+    def matches_ua(self, target_ua: str) -> Optional[int]:
+        """Return match priority (longest matched UA token length) or None."""
+        target = target_ua.lower()
+        longest_match = -1
+        matched = False
+        for ua in self.user_agents:
+            if ua == "*":
+                if longest_match < 0:
+                    longest_match = 0
+                    matched = True
+            elif ua in target:
+                if len(ua) > longest_match:
+                    longest_match = len(ua)
+                    matched = True
+        return longest_match if matched else None
+
+
+class RFC9309RobotsParser:
+    """Pure-Python offline parser implementing RFC 9309:
+    - User-Agent specific group matching.
+    - Path comparison is case-sensitive.
+    - Longest rule match (most specific rule wins).
+    - On equal length match, Allow wins over Disallow.
+    - Wildcard (*) and end-of-path ($) support.
+    """
+
+    def __init__(self):
+        self.groups: List[RFC9309Group] = []
+
+    def parse(self, lines: List[str]) -> None:
+        current_uas: List[str] = []
+        current_rules: List[Tuple[bool, str]] = []
+        state = "UA"
+
+        def commit_group():
+            if current_uas:
+                group = RFC9309Group(current_uas)
+                for is_allow, pattern in current_rules:
+                    group.rules.append(RFC9309Rule(is_allow, pattern))
+                self.groups.append(group)
+
+        for raw_line in lines:
+            line = raw_line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            if ":" not in line:
+                continue
+            field, val = line.split(":", 1)
+            field = field.strip().lower()
+            val = val.strip()
+
+            if field == "user-agent":
+                if state == "RULE":
+                    commit_group()
+                    current_uas = []
+                    current_rules = []
+                    state = "UA"
+                current_uas.append(val)
+            elif field in ("allow", "disallow"):
+                state = "RULE"
+                if field == "allow":
+                    if val:
+                        current_rules.append((True, val))
+                else:
+                    if val:
+                        current_rules.append((False, val))
+                    else:
+                        current_rules.append((True, "/"))
+
+        if current_uas:
+            commit_group()
+
+    def can_fetch(self, user_agent: str, url_or_path: str) -> bool:
+        if not self.groups:
+            return True
+
+        if url_or_path.startswith(("http://", "https://")):
+            parsed = urllib.parse.urlsplit(url_or_path)
+            target_path = parsed.path or "/"
+            if parsed.query:
+                target_path += "?" + parsed.query
+        else:
+            target_path = url_or_path if url_or_path.startswith("/") else "/" + url_or_path
+
+        best_ua_len = -1
+        matching_groups: List[RFC9309Group] = []
+
+        for group in self.groups:
+            match_len = group.matches_ua(user_agent)
+            if match_len is not None:
+                if match_len > best_ua_len:
+                    best_ua_len = match_len
+                    matching_groups = [group]
+                elif match_len == best_ua_len:
+                    matching_groups.append(group)
+
+        if not matching_groups:
+            return True
+
+        matching_rules: List[RFC9309Rule] = []
+        for group in matching_groups:
+            for rule in group.rules:
+                if rule.matches(target_path):
+                    matching_rules.append(rule)
+
+        if not matching_rules:
+            return True
+
+        matching_rules.sort(key=lambda r: (r.length, 1 if r.is_allow else 0), reverse=True)
+        return matching_rules[0].is_allow
+
+
+def _matches_path_prefix(path: str, prefix: str) -> bool:
+    """Enforce strict directory boundary matching.
+    Prefix '/' matches all paths.
+    Prefix '/public' or '/public/' matches '/public', '/public/', '/public/foo',
+    but NEVER matches '/publicity' or '/public_notes'.
+    """
+    if not prefix:
+        return False
+    if prefix == "/":
+        return True
+    clean_prefix = prefix.rstrip("/")
+    if not clean_prefix:
+        return True
+    return path == clean_prefix or path.startswith(clean_prefix + "/")
+
+
 class SourcePolicyEngine:
     """Pure deterministic engine governing controlled access, allowlist matching,
     discrete authorization status checking, and robots.txt gating.
@@ -211,7 +374,7 @@ class SourcePolicyEngine:
         self.user_agent = user_agent
         # robots_fetcher must be an injected mock/offline fetcher
         self._robots_fetcher = robots_fetcher
-        self._robots_cache: Dict[str, urllib.robotparser.RobotFileParser] = {}
+        self._robots_cache: Dict[str, RFC9309RobotsParser] = {}
         self._robots_status_cache: Dict[str, RobotsFetchStatus] = {}
 
     @staticmethod
@@ -266,13 +429,34 @@ class SourcePolicyEngine:
         if port is None:
             port = 443 if scheme == "https" else 80
 
-        # 5. Path normalization
-        path = parsed.path
-        if not path:
-            path = "/"
-        else:
-            # Normalize double slashes and dot segments
-            path = urllib.parse.urljoin("/", path)
+        # 5. Path normalization & Defensive Encoding Defense (Fail-Closed)
+        if "\0" in url_str or "%00" in url_str.lower():
+            raise ValueError("Null byte in URL is prohibited")
+        if "\\" in url_str:
+            raise ValueError("Backslash in URL is prohibited")
+
+        raw_path = parsed.path or "/"
+        if re.search(r"%(?![0-9a-fA-F]{2})", raw_path):
+            raise ValueError("Malformed percent-encoding in path")
+
+        # Inspect raw path for prohibited / ambiguous percent encodings:
+        # %2E (dot), %2F (slash), %5C (backslash), %25 (percent / multi-layer), %00 (null byte)
+        for m in re.finditer(r"(?i)%([0-9a-f]{2})", raw_path):
+            code = m.group(1).upper()
+            if code in ("2E", "2F", "5C", "25", "00"):
+                raise ValueError(f"Ambiguous or prohibited percent-encoding %{code} in path")
+            byte_val = int(code, 16)
+            if byte_val < 32 or byte_val == 127:
+                raise ValueError(f"Prohibited control character encoding %{code} in path")
+
+        # Normalize dot segments and double slashes strictly
+        had_trailing_slash = raw_path.endswith("/")
+        norm_path = posixpath.normpath(raw_path)
+        if not norm_path.startswith("/"):
+            norm_path = "/" + norm_path.lstrip("/")
+        if had_trailing_slash and not norm_path.endswith("/"):
+            norm_path += "/"
+        path = norm_path
 
         # 6. Query normalization (sort keys for canonicalization)
         query_str = ""
@@ -306,12 +490,12 @@ class SourcePolicyEngine:
                 del self._robots_cache[domain_clean]
             return
 
-        parser = urllib.robotparser.RobotFileParser()
+        parser = RFC9309RobotsParser()
         parser.parse(robots_content.splitlines())
         self._robots_cache[domain_clean] = parser
         self._robots_status_cache[domain_clean] = RobotsFetchStatus.FETCHED_AND_PARSED
 
-    def _get_robots_parser(self, domain: str) -> tuple[Optional[urllib.robotparser.RobotFileParser], RobotsFetchStatus]:
+    def _get_robots_parser(self, domain: str) -> tuple[Optional[RFC9309RobotsParser], RobotsFetchStatus]:
         """Retrieve or fetch (via mock) robots.txt parser. Returns (parser, status)."""
         domain_clean = domain.strip(".").lower()
         if domain_clean in self._robots_status_cache:
@@ -321,7 +505,7 @@ class SourcePolicyEngine:
             try:
                 content = self._robots_fetcher(domain_clean)
                 if content is not None:
-                    parser = urllib.robotparser.RobotFileParser()
+                    parser = RFC9309RobotsParser()
                     parser.parse(content.splitlines())
                     self._robots_cache[domain_clean] = parser
                     self._robots_status_cache[domain_clean] = RobotsFetchStatus.FETCHED_AND_PARSED
@@ -464,10 +648,10 @@ class SourcePolicyEngine:
                 reason=f"Port {norm.port} is not in allowed ports {target_scope.allowed_ports}",
             )
 
-        # 5. Path checks
-        # First check disallowed paths
+        # 5. Path checks (Fail-Closed)
+        # First check explicitly disallowed paths with boundary awareness
         for dis in target_scope.disallowed_path_prefixes:
-            if norm.path.startswith(dis):
+            if _matches_path_prefix(norm.path, dis):
                 return PolicyDecision(
                     decision=DecisionCode.DENIED_PATH_OUT_OF_SCOPE,
                     allowed=False,
@@ -477,22 +661,33 @@ class SourcePolicyEngine:
                     reason=f"Path {norm.path} is prohibited by prefix '{dis}'",
                 )
 
-        # If allowed paths are specified, must match at least one
-        if target_scope.allowed_path_prefixes:
-            matched_prefix = False
-            for allowed_pref in target_scope.allowed_path_prefixes:
-                if norm.path.startswith(allowed_pref):
-                    matched_prefix = True
-                    break
-            if not matched_prefix:
-                return PolicyDecision(
-                    decision=DecisionCode.DENIED_PATH_OUT_OF_SCOPE,
-                    allowed=False,
-                    company_id=target_scope.company_id,
-                    url=url,
-                    normalized_url=norm,
-                    reason=f"Path {norm.path} is outside allowed path prefixes",
-                )
+        # Allowed paths check:
+        # If allowed_path_prefixes is empty, FAIL-CLOSED DENY.
+        # Explicit root "/" must be configured to grant whole-site access.
+        if not target_scope.allowed_path_prefixes:
+            return PolicyDecision(
+                decision=DecisionCode.DENIED_PATH_OUT_OF_SCOPE,
+                allowed=False,
+                company_id=target_scope.company_id,
+                url=url,
+                normalized_url=norm,
+                reason="No allowed path prefixes configured for target (fail-closed deny)",
+            )
+
+        matched_prefix = False
+        for allowed_pref in target_scope.allowed_path_prefixes:
+            if _matches_path_prefix(norm.path, allowed_pref):
+                matched_prefix = True
+                break
+        if not matched_prefix:
+            return PolicyDecision(
+                decision=DecisionCode.DENIED_PATH_OUT_OF_SCOPE,
+                allowed=False,
+                company_id=target_scope.company_id,
+                url=url,
+                normalized_url=norm,
+                reason=f"Path {norm.path} is outside allowed path prefixes",
+            )
 
         # 6. Content-Type check (if provided in header inspection / pre-flight)
         if content_type:
