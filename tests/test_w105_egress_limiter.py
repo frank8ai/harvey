@@ -33,6 +33,7 @@ from harvey.controlled_discovery.limiter import (
     ConcurrencyTimeoutError,
     FakeClock,
     LeaseReleaseOutcome,
+    LeaseExpiredError,
     LimiterConfig,
     LimiterError,
     MaxRetriesExceededError,
@@ -42,6 +43,7 @@ from harvey.controlled_discovery.limiter import (
     RequestLease,
     ResponseBodyMeter,
     ResponseSizeLimitExceededError,
+    is_pid_alive,
     normalize_domain,
     parse_retry_after,
 )
@@ -545,3 +547,178 @@ def test_cross_process_concurrency_race_condition(tmp_path):
         assert r["active_global_during_hold"] <= 2, (
             f"Global concurrency breached: {r['active_global_during_hold']} > 2"
         )
+
+
+# ── 12. Cross-Process Lease & Clock Safety Invariants (W1-05-B-R Hardening) ──
+
+@pytest.mark.asyncio
+async def test_auto_renewal_prevents_double_leasing(tmp_path):
+    """
+    Long request (> 30s TTL) under auto-renewal MUST keep lease alive.
+    Other workers MUST NOT be able to acquire a 2nd concurrent permit.
+    """
+    db_file = tmp_path / "auto_renew.db"
+    clock = FakeClock(start_time=100.0, auto_advance_on_sleep=True)
+    config = LimiterConfig(
+        offline_mode=False,
+        global_concurrency=1,
+        per_domain_concurrency=1,
+        lease_ttl_seconds=30.0,
+    )
+    limiter = PersistentEgressLimiter(str(db_file), config, clock=clock)
+    await limiter.init_db()
+
+    async with await limiter.acquire("https://target.com") as l1:
+        assert l1.expires_at == 130.0
+
+        # Advance clock by 35s in simulated increments
+        clock.advance(20.0)
+        await asyncio.sleep(0.01)
+        assert l1.expires_at >= 150.0  # renewed!
+
+        clock.advance(15.0)
+        await asyncio.sleep(0.01)
+        assert l1.expires_at >= 165.0  # renewed again!
+
+        # Worker 2 attempts acquire: MUST be blocked
+        with pytest.raises(ConcurrencyTimeoutError):
+            await limiter.acquire("https://target.com", timeout=0.1)
+
+        assert await limiter.get_active_leases_count("target.com") == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_expired_lease_cannot_release_or_corrupt_state(tmp_path):
+    """
+    When a worker loses its lease (e.g. paused/zombie past TTL), releasing it
+    MUST be rejected from corrupting or resetting the domain's newer cooldown state.
+    """
+    db_file = tmp_path / "stale_release.db"
+    clock = FakeClock(start_time=100.0, auto_advance_on_sleep=True)
+    config = LimiterConfig(
+        offline_mode=False,
+        lease_ttl_seconds=30.0,
+    )
+    limiter = PersistentEgressLimiter(str(db_file), config, clock=clock)
+    await limiter.init_db()
+
+    # Worker 1 acquires manually without auto-renew
+    l1 = await limiter.acquire("https://target.com")
+
+    # Clock jumps 35s ahead -> lease expires in DB
+    clock.advance(35.0)
+
+    # Worker 2 acquires and records 429 Retry-After: 120s
+    l2 = await limiter.acquire("https://target.com")
+    await l2.release(outcome=LeaseReleaseOutcome.RATE_LIMITED, retry_after_seconds=120.0, http_status=429)
+
+    st_before = await limiter.get_domain_state("target.com")
+    assert st_before["consecutive_failures"] == 1
+    assert st_before["cooldown_until"] == 255.0  # 135.0 + 120.0
+
+    # Stale Worker 1 now tries to release SUCCESS
+    await l1.release(outcome=LeaseReleaseOutcome.SUCCESS)
+
+    st_after = await limiter.get_domain_state("target.com")
+    # Domain failure count and cooldown MUST NOT be cleared by stale worker
+    assert st_after["consecutive_failures"] == 1
+    assert st_after["cooldown_until"] == st_before["cooldown_until"]
+
+
+@pytest.mark.asyncio
+async def test_429_long_retry_after_not_clipped(tmp_path):
+    """
+    A 429 Retry-After of 300s (5m) MUST NOT be clipped to max_retry_backoff_seconds (30s).
+    """
+    db_file = tmp_path / "long_429.db"
+    clock = FakeClock(start_time=100.0, auto_advance_on_sleep=True)
+    config = LimiterConfig(
+        offline_mode=False,
+        max_retry_backoff_seconds=30.0,
+    )
+    limiter = PersistentEgressLimiter(str(db_file), config, clock=clock)
+    await limiter.init_db()
+
+    lease = await limiter.acquire("https://target.com")
+    await lease.release(outcome=LeaseReleaseOutcome.RATE_LIMITED, retry_after_seconds=300.0, http_status=429)
+
+    # At T=131.0 (31 seconds later, > 30s max backoff), cooldown MUST still be active
+    clock.advance(31.0)
+    acquired, wait_sugg = await limiter._try_acquire_transaction("target.com", 1, clock.now())
+    assert acquired is None
+    assert wait_sugg == 269.0  # Exactly 400.0 - 131.0
+
+
+@pytest.mark.asyncio
+async def test_cross_domain_redirect_enforces_target_concurrency(tmp_path):
+    """
+    Redirecting to a different domain must check and enforce the target domain's
+    per_domain_concurrency limit.
+    """
+    db_file = tmp_path / "redirect_conc.db"
+    clock = FakeClock(start_time=100.0, auto_advance_on_sleep=True)
+    config = LimiterConfig(
+        offline_mode=False,
+        global_concurrency=2,
+        per_domain_concurrency=1,
+    )
+    limiter = PersistentEgressLimiter(str(db_file), config, clock=clock)
+    await limiter.init_db()
+
+    # Worker 1 holds domain-b
+    l_b = await limiter.acquire("https://domain-b.com")
+    # Worker 2 holds domain-a
+    l_a = await limiter.acquire("https://domain-a.com")
+
+    # Worker 2 redirects to domain-b: MUST be blocked because domain-b has concurrency=1
+    with pytest.raises(ConcurrencyTimeoutError):
+        await l_a.record_redirect("https://domain-b.com/target")
+
+    await l_a.release()
+    await l_b.release()
+
+
+def test_sigkill_crash_recovery_os_process(tmp_path):
+    """
+    True OS child process killed with SIGKILL / taskkill must be promptly reclaimed
+    by recover_stale_leases via PID liveness checking even before lease_ttl_seconds.
+    """
+    db_file = str(tmp_path / "sigkill.db")
+
+    # Child worker function running in external process
+    worker_code = f"""
+import asyncio
+from harvey.controlled_discovery.limiter import PersistentEgressLimiter, LimiterConfig
+async def main():
+    limiter = PersistentEgressLimiter(r'{db_file}', LimiterConfig(offline_mode=False, lease_ttl_seconds=300.0))
+    await limiter.init_db()
+    lease = await limiter.acquire('https://crash-target.com')
+    print('ACQUIRED', flush=True)
+    await asyncio.sleep(60.0)
+asyncio.run(main())
+"""
+    import subprocess
+    proc = subprocess.Popen(
+        [sys.executable, "-c", worker_code],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    line = proc.stdout.readline().strip()
+    assert line == "ACQUIRED"
+    dead_pid = proc.pid
+
+    # Terminate process abruptly (SIGKILL equivalent on Windows)
+    proc.kill()
+    proc.wait()
+    assert not is_pid_alive(dead_pid)
+
+    # Now sweep in main process
+    async def sweep():
+        limiter = PersistentEgressLimiter(db_file, LimiterConfig(offline_mode=False))
+        await limiter.init_db()
+        reclaimed = await limiter.recover_stale_leases()
+        assert reclaimed >= 1
+        assert await limiter.get_active_leases_count("crash-target.com") == 0
+
+    asyncio.run(sweep())

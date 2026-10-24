@@ -11,8 +11,11 @@ Purely local component; strictly offline by default; zero live outbound calls un
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import email.utils
+import logging
 import os
+import sys
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -34,6 +37,38 @@ from urllib.parse import urlparse
 
 import aiosqlite
 
+logger = logging.getLogger("harvey.controlled_discovery.limiter")
+
+
+def is_pid_alive(pid: int) -> bool:
+    """
+    Check if an OS process with the given PID is currently alive.
+    Safe against zombie/stale PIDs on Windows and POSIX.
+    """
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            exit_code = ctypes.c_ulong()
+            if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return exit_code.value == STILL_ACTIVE
+            return False
+        finally:
+            kernel32.CloseHandle(handle)
+    else:
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError as e:
+            import errno
+            return e.errno == errno.EPERM
+
 
 # ── Clock Protocol & Implementations ──────────────────────────────────────────
 
@@ -48,8 +83,12 @@ class Clock(Protocol):
 
 
 class SystemClock:
+    """
+    Monotonic system clock immune to NTP / system wall-clock backward and forward steps.
+    Guarantees consistent rate intervals, lease deadlines, and monotonic cooldown calculation.
+    """
     def now(self) -> float:
-        return time.time()
+        return time.monotonic()
 
     async def sleep(self, seconds: float) -> None:
         await asyncio.sleep(seconds)
@@ -59,17 +98,32 @@ class FakeClock:
     """
     Deterministic controllable clock for high-speed simulation testing.
     Can auto-advance simulated time when sleeping, preventing slow real-world pauses.
+    Supports synchronous tick callbacks for auto-renew and TTL expiration simulations.
     """
 
     def __init__(self, start_time: float = 1000.0, auto_advance_on_sleep: bool = True):
         self._current_time = float(start_time)
         self.auto_advance_on_sleep = auto_advance_on_sleep
+        self._tick_listeners: list[Callable[[float], None]] = []
 
     def now(self) -> float:
         return self._current_time
 
+    def add_tick_listener(self, cb: Callable[[float], None]) -> None:
+        if cb not in self._tick_listeners:
+            self._tick_listeners.append(cb)
+
+    def remove_tick_listener(self, cb: Callable[[float], None]) -> None:
+        if cb in self._tick_listeners:
+            self._tick_listeners.remove(cb)
+
     def advance(self, seconds: float) -> None:
         self._current_time += float(seconds)
+        for cb in list(self._tick_listeners):
+            try:
+                cb(self._current_time)
+            except Exception:
+                pass
 
     async def sleep(self, seconds: float) -> None:
         if self.auto_advance_on_sleep and seconds > 0:
@@ -99,6 +153,11 @@ class LimiterAcquireStatus(str, Enum):
 
 class LimiterError(Exception):
     """Base exception for egress limiter errors."""
+    pass
+
+
+class LeaseExpiredError(LimiterError):
+    """Raised when an active lease has expired, failed renewal, or lost ownership."""
     pass
 
 
@@ -275,7 +334,13 @@ class RequestLease:
     acquired_at: float
     limiter: "PersistentEgressLimiter" = field(repr=False)
     bytes_metered: int = 0
+    expires_at: float = 0.0
     _released: bool = field(default=False, repr=False)
+    _renewal_task: Optional[asyncio.Task] = field(default=None, repr=False)
+    _renewal_active: bool = field(default=False, repr=False)
+    _lost_ownership: bool = field(default=False, repr=False)
+    _bound_task: Optional[asyncio.Task] = field(default=None, repr=False)
+    _tick_listener: Optional[Callable[[float], None]] = field(default=None, repr=False)
 
     async def release(
         self,
@@ -287,7 +352,9 @@ class RequestLease:
         """
         Release the active lease and record domain rate limit / backoff / audit stats.
         Idempotent: safe to call multiple times without state corruption.
+        Guarantees only the legitimate current owner can update domain status or release.
         """
+        self.stop_auto_renewal()
         if self._released:
             return
         self._released = True
@@ -314,6 +381,7 @@ class RequestLease:
         Record a redirect step against this lease and enforce the maximum redirects cap.
         If a new domain is targeted, validates domain transition within redirect bounds.
         """
+        self.assert_valid()
         self.redirects_used += 1
         if self.redirects_used > self.limiter.config.max_redirects:
             raise RedirectLimitExceededError(self.redirects_used, self.limiter.config.max_redirects)
@@ -329,10 +397,101 @@ class RequestLease:
 
     async def renew(self, extra_ttl_seconds: Optional[float] = None) -> float:
         """Extend lease expiration time to protect long active streaming transfers."""
+        if self._lost_ownership:
+            raise LeaseExpiredError(f"Lease {self.lease_id} has already lost ownership")
         if self._released:
             raise LimiterError("Cannot renew an already released lease")
         ttl = extra_ttl_seconds if extra_ttl_seconds is not None else self.limiter.config.lease_ttl_seconds
-        return await self.limiter._renew_lease(self.lease_id, ttl)
+        try:
+            new_expires = await self.limiter._renew_lease(self.lease_id, ttl)
+            self.expires_at = new_expires
+            return new_expires
+        except Exception as e:
+            self._lost_ownership = True
+            self._abort_bound_task(f"Lease renewal failed: {e}")
+            raise LeaseExpiredError(f"Lease renewal failed: {e}") from e
+
+    def assert_valid(self) -> None:
+        """Fail-closed assertion: verify this lease has not expired or lost ownership."""
+        if self._lost_ownership:
+            raise LeaseExpiredError(f"Lease {self.lease_id} has lost ownership or failed renewal")
+        if self._released:
+            raise LimiterError(f"Lease {self.lease_id} has already been released")
+        if self.expires_at > 0 and self.limiter.clock.now() >= self.expires_at:
+            self._lost_ownership = True
+            self._abort_bound_task(f"Lease {self.lease_id} exceeded TTL without renewal")
+            raise LeaseExpiredError(f"Lease {self.lease_id} has expired (now >= expires_at)")
+
+    def start_auto_renewal(self, bound_task: Optional[asyncio.Task] = None) -> None:
+        """
+        Start background auto-renewal loop to keep lease alive during long operations.
+        If renewal fails or lease expires, immediately aborts the bound task.
+        """
+        if self._renewal_active or self._released:
+            return
+        self._renewal_active = True
+        self._bound_task = bound_task
+        clock = self.limiter.clock
+        if hasattr(clock, "add_tick_listener"):
+            # For FakeClock deterministic simulation: register tick listener
+            def _on_tick(current_now: float) -> None:
+                if self._renewal_active and not self._released and not self._lost_ownership:
+                    if current_now >= self.expires_at - (self.limiter.config.lease_ttl_seconds * 0.5):
+                        asyncio.create_task(self._safe_renew())
+
+            self._tick_listener = _on_tick
+            clock.add_tick_listener(_on_tick)
+        else:
+            interval = max(0.5, self.limiter.config.lease_ttl_seconds / 3.0)
+
+            async def _renewal_loop():
+                while self._renewal_active and not self._released and not self._lost_ownership:
+                    try:
+                        await self.limiter.clock.sleep(interval)
+                    except asyncio.CancelledError:
+                        break
+                    except Exception:
+                        pass
+
+                    if not self._renewal_active or self._released:
+                        break
+
+                    try:
+                        new_exp = await self.renew()
+                        self.expires_at = new_exp
+                    except Exception as exc:
+                        logger.warning("Background renewal failed for lease %s: %s", self.lease_id, exc)
+                        self._lost_ownership = True
+                        self._abort_bound_task(f"Background renewal failed: {exc}")
+                        break
+
+            self._renewal_task = asyncio.create_task(_renewal_loop())
+
+    async def _safe_renew(self) -> None:
+        try:
+            if self._renewal_active and not self._released and not self._lost_ownership:
+                new_exp = await self.renew()
+                self.expires_at = new_exp
+        except Exception:
+            pass
+
+    def stop_auto_renewal(self) -> None:
+        """Stop the background auto-renewal loop cleanly."""
+        self._renewal_active = False
+        if self._renewal_task and not self._renewal_task.done():
+            self._renewal_task.cancel()
+            self._renewal_task = None
+        if self._tick_listener:
+            clock = self.limiter.clock
+            if hasattr(clock, "remove_tick_listener"):
+                clock.remove_tick_listener(self._tick_listener)
+            self._tick_listener = None
+
+    def _abort_bound_task(self, reason: str) -> None:
+        """Abort bound controlled request task when lease safety is compromised."""
+        if self._bound_task and not self._bound_task.done():
+            logger.error("Aborting controlled request task due to lost lease safety: %s", reason)
+            self._bound_task.cancel()
 
     def new_meter(self) -> ResponseBodyMeter:
         """Instantiate a response body meter bound to the limiter's size cap."""
@@ -340,9 +499,12 @@ class RequestLease:
         return meter
 
     async def __aenter__(self) -> "RequestLease":
+        current_task = asyncio.current_task()
+        self.start_auto_renewal(bound_task=current_task)
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.stop_auto_renewal()
         if not self._released:
             if exc_type is None:
                 await self.release(LeaseReleaseOutcome.SUCCESS)
@@ -350,6 +512,8 @@ class RequestLease:
                 await self.release(LeaseReleaseOutcome.CANCELLED)
             elif issubclass(exc_type, (asyncio.TimeoutError, ConcurrencyTimeoutError)):
                 await self.release(LeaseReleaseOutcome.TIMEOUT)
+            elif issubclass(exc_type, LeaseExpiredError):
+                await self.release(LeaseReleaseOutcome.FAILURE)
             else:
                 await self.release(LeaseReleaseOutcome.FAILURE)
 
@@ -519,6 +683,21 @@ class PersistentEgressLimiter:
             await conn.execute("BEGIN IMMEDIATE;")
 
             # Step 1: Clean up expired leases
+            cursor = await conn.execute(
+                "SELECT lease_id, worker_pid, expires_at FROM egress_leases WHERE expires_at < ?",
+                (now,),
+            )
+            expired_rows = await cursor.fetchall()
+            await cursor.close()
+
+            if expired_rows:
+                expired_ids = [r[0] for r in expired_rows]
+                placeholders = ",".join("?" for _ in expired_ids)
+                await conn.execute(
+                    f"DELETE FROM egress_leases WHERE lease_id IN ({placeholders})",
+                    expired_ids,
+                )
+
             await conn.execute(
                 "DELETE FROM egress_leases WHERE expires_at < ?",
                 (now,),
@@ -538,8 +717,6 @@ class PersistentEgressLimiter:
                 # Clock skew defense
                 if last_request_at > now:
                     last_request_at = now
-                if cooldown_until > now + self.config.max_retry_backoff_seconds:
-                    cooldown_until = now + self.config.max_retry_backoff_seconds
 
                 # Check active cooldown (e.g. 429 Retry-After or failure backoff)
                 if now < cooldown_until:
@@ -607,6 +784,7 @@ class PersistentEgressLimiter:
                 redirects_used=0,
                 acquired_at=now,
                 limiter=self,
+                expires_at=expires_at,
             )
             return lease, None
 
@@ -645,11 +823,26 @@ class PersistentEgressLimiter:
         try:
             await conn.execute("BEGIN IMMEDIATE;")
 
+            # Ownership verification: ensure this lease actually exists and belongs to us
+            cursor = await conn.execute(
+                "SELECT domain, expires_at FROM egress_leases WHERE lease_id = ?",
+                (lease_id,),
+            )
+            lease_row = await cursor.fetchone()
+            await cursor.close()
+
+            is_valid_owner = lease_row is not None
+
             # 1. Delete lease
             await conn.execute(
                 "DELETE FROM egress_leases WHERE lease_id = ?",
                 (lease_id,),
             )
+
+            # If this lease expired or was already reclaimed, do NOT overwrite domain state!
+            if not is_valid_owner:
+                await conn.commit()
+                return
 
             # 2. Update domain state
             cursor = await conn.execute(
@@ -667,6 +860,7 @@ class PersistentEgressLimiter:
             elif outcome == LeaseReleaseOutcome.RATE_LIMITED or http_status == 429:
                 failures += 1
                 if retry_after_seconds is not None and retry_after_seconds > 0:
+                    # Preserve full 429 Retry-After window (do not clip to max_retry_backoff_seconds)
                     cooldown_duration = retry_after_seconds
                 else:
                     cooldown_duration = min(
@@ -741,9 +935,35 @@ class PersistentEgressLimiter:
 
     async def _transfer_lease_domain(self, lease_id: str, old_domain: str, new_domain: str) -> None:
         """Update lease domain in database when following a cross-domain redirect."""
+        now = self.clock.now()
         conn = await self._get_conn()
         try:
             await conn.execute("BEGIN IMMEDIATE;")
+
+            # Verify lease is still valid and unexpired
+            cursor = await conn.execute(
+                "SELECT domain, expires_at FROM egress_leases WHERE lease_id = ? AND expires_at >= ?",
+                (lease_id, now),
+            )
+            lease_row = await cursor.fetchone()
+            await cursor.close()
+            if not lease_row:
+                await conn.commit()
+                raise LeaseExpiredError(f"Lease {lease_id} expired before redirect transfer")
+
+            # Enforce per_domain_concurrency limit on new target domain
+            cursor = await conn.execute(
+                "SELECT COUNT(*) FROM egress_leases WHERE domain = ? AND expires_at >= ?",
+                (new_domain, now),
+            )
+            target_active = (await cursor.fetchone())[0]
+            await cursor.close()
+            if target_active >= self.config.per_domain_concurrency:
+                await conn.commit()
+                raise ConcurrencyTimeoutError(
+                    f"Cannot redirect to {new_domain}: target domain concurrency limit ({self.config.per_domain_concurrency}) reached"
+                )
+
             await conn.execute(
                 "UPDATE egress_leases SET domain = ? WHERE lease_id = ?",
                 (new_domain, lease_id),
@@ -807,12 +1027,30 @@ class PersistentEgressLimiter:
         conn = await self._get_conn()
         try:
             await conn.execute("BEGIN IMMEDIATE;")
+
+            # Sweep expired leases
             cursor = await conn.execute(
                 "DELETE FROM egress_leases WHERE expires_at < ?",
                 (now,),
             )
             deleted = cursor.rowcount
             await cursor.close()
+
+            # Sweep dead worker PIDs (SIGKILL crash recovery)
+            cursor = await conn.execute("SELECT lease_id, worker_pid FROM egress_leases")
+            active_rows = await cursor.fetchall()
+            await cursor.close()
+
+            dead_ids = [lid for lid, pid in active_rows if not is_pid_alive(pid)]
+            if dead_ids:
+                placeholders = ",".join("?" for _ in dead_ids)
+                cursor = await conn.execute(
+                    f"DELETE FROM egress_leases WHERE lease_id IN ({placeholders})",
+                    dead_ids,
+                )
+                deleted += cursor.rowcount
+                await cursor.close()
+
             await conn.commit()
             return deleted
         finally:
