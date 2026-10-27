@@ -6,7 +6,7 @@ using SQLite transactions and WAL mode.
 
 Enforces Fail-Closed behavior:
 - Zero external budget under unauthorized mode.
-- Run-level and daily HTTP request limits.
+- Run-level and daily HTTP request limits (strictly tracked in UTC date).
 - Search API call limits.
 - Model token billing / quota accounting (USD cost and tokens/calls).
 - Conservative handling of timeouts, network failures, and unknown pricing.
@@ -105,7 +105,8 @@ def _utcnow() -> str:
 
 
 def _today_str() -> str:
-    return date.today().isoformat()
+    """Return current date string formatted as YYYY-MM-DD in UTC timezone."""
+    return datetime.now(timezone.utc).date().isoformat()
 
 
 class HardBudgetLedger:
@@ -326,8 +327,20 @@ class HardBudgetLedger:
                         f"Reservation {reservation_id} has already been settled"
                     )
 
-                # Conservative fallbacks:
-                # On timeout, failure, or None, default to the reserved amount
+                # Conservative fail-closed fallbacks:
+                # Actual unknown (None), failed, or timed-out usage defaults to full reserved amount.
+                # Unknown cost is NEVER interpreted as zero cost. Negative amounts are forbidden.
+                if actual_http_requests is not None and actual_http_requests < 0:
+                    raise ValueError("actual_http_requests cannot be negative")
+                if actual_search_calls is not None and actual_search_calls < 0:
+                    raise ValueError("actual_search_calls cannot be negative")
+                if actual_cost_usd is not None and actual_cost_usd < 0:
+                    raise ValueError("actual_cost_usd cannot be negative")
+                if actual_tokens is not None and actual_tokens < 0:
+                    raise ValueError("actual_tokens cannot be negative")
+                if actual_subscription_units is not None and actual_subscription_units < 0:
+                    raise ValueError("actual_subscription_units cannot be negative")
+
                 final_http = (
                     actual_http_requests
                     if actual_http_requests is not None
