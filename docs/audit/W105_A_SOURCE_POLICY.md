@@ -1,6 +1,6 @@
 # W1-05-A Source Policy & Robots Gating Architecture Audit
 
-**Status**: COMPONENT_READY  
+**Status**: REMEDIATION_COMPLETE (W1-05-A-R Closed)  
 **Module**: `harvey.controlled_discovery.policy`  
 **Execution Context**: Offline Rules Engine / Zero Public Network Egress  
 **Target Gate**: FetchInbox 20 Controlled Study Inbound & Outbound Access Control  
@@ -105,5 +105,28 @@ class PolicyDecision:
 ## 5. 验收裁决
 
 - `SOURCE_POLICY_COMPONENT_READY = PASS`
+- `CONTROLLED_DISCOVERY_READY = HOLD` (维持暂停，待下游 Agent 调度与受控环境就绪)
+- `LIVE_OUTREACH_READY = FORBIDDEN` (严禁公网主动发信与采集)
+
+---
+
+## 6. 安全审计缺陷终验与整改记录 (W1-05-A-R Remediation)
+
+针对独立安全审计与 Red Team 报告发现的 4 项关键安全缺陷（SEC-01 至 SEC-04），本阶段完成了严格的 Red-before-Green 复现、代码修复与闭环断言。
+
+### 6.1 缺陷整改与加固措施矩阵
+| 缺陷编号 | 威胁级别 | 缺陷类型与攻击场景 | 修复与加固实现 (Fail-Closed) |
+| :--- | :--- | :--- | :--- |
+| **SEC-01** | **P0** | 编码路径穿越与歧义转义 (`%2e`, `%2f`, `%5c`, `%25`, 多层编码, 反斜杠, 空字节) 绕过白名单路径检查 | 在 `normalize_url` 引入严格 Fail-Closed 过滤：URL 含 `\`、空字节或路径含 `%2E`, `%2F`, `%5C`, `%25`, `%00` 及畸形 `%` 编码直接拒绝，抛出 `ValueError` (映射为 `DENIED_MALFORMED_URL`)；路径采用 `posixpath.normpath` 严格规范化。 |
+| **SEC-02** | **P1** | 空白名单放行漏洞 (`allowed_path_prefixes = []` 漏判放行任意路径) | `evaluate_url` 增加 Fail-Closed 判定：当 `allowed_path_prefixes` 为空时直接返回 `DENIED_PATH_OUT_OF_SCOPE`。若确需授权全站，必须显式配置 `["/"]`。 |
+| **SEC-03** | **P1** | `urllib.robotparser` 标准库缺陷 (不支持最长规则优先、同长度 Allow > Disallow 颠倒、不支持通配符 `*` 与行尾 `$`、忽略大小写敏感性) | 实现无依赖的 `RFC9309RobotsParser`、`RFC9309Group` 与 `RFC9309Rule` 纯 Python 引擎：严格遵循 RFC 9309 最具体规则匹配 (Longest Match)、同长 Allow 胜出、`*` 与 `$` 正则编译、区分大小写路径比对及 User-Agent 精确匹配优先于通配。 |
+| **SEC-04** | **P1** | 前缀边界混淆漏洞 (`/public` 误放行 `/publicity`, `/public_notes`) | 引入 `_matches_path_prefix(path, prefix)` 严格目录边界匹配：仅当路径与前缀完全一致或后接 `/` 时放行，彻底阻断字符串前缀混淆。 |
+
+### 6.2 Red-before-Green 验证证据
+- **Red 阶段**：在 `tests/test_w105_source_policy.py` 中编写 `TestSecurityDefectsRedReproductions`，在原缺陷版本下精准复现全部 6 项失败（SEC-01 编码穿越放行、SEC-02 空前缀放行、SEC-03 顺序相关/通配符失效、SEC-04 前缀混淆越界）。
+- **Green 阶段**：加固代码落地后，35 项专项用例 100% 通过；联合 109 项安全与业务回归用例 100% 绿灯通过，0 真实网络套接字请求。
+
+### 6.3 最终门禁状态
+- `MERGE_READY = PASS`
 - `CONTROLLED_DISCOVERY_READY = HOLD` (维持暂停，待下游 Agent 调度与受控环境就绪)
 - `LIVE_OUTREACH_READY = FORBIDDEN` (严禁公网主动发信与采集)

@@ -290,3 +290,198 @@ class TestRedirectAndLifecycleGates:
         assert not decision.allowed
         assert decision.decision == DecisionCode.DENIED_INSUFFICIENT_PERMISSIONS
         assert "Missing mandatory authorization dimensions" in decision.reason
+
+
+class TestSecurityDefectsRedReproductions:
+    """Explicit Red-before-Green reproductions for SEC-01 through SEC-04."""
+
+    def test_sec_01_reject_ambiguous_and_traversal_encodings(self, engine_with_acme):
+        # %2e%2e, %2f, %5c, %25 multi-layer, raw backslash, null bytes
+        malicious_urls = [
+            "https://acme-corp.test/public/%2e%2e/admin",
+            "https://acme-corp.test/public/%2E%2E/admin",
+            "https://acme-corp.test/public/%2e%2e%2fadmin",
+            "https://acme-corp.test/public/%252e%252e/admin",
+            "https://acme-corp.test/public/%25252e/admin",
+            "https://acme-corp.test/public/%2fadmin",
+            "https://acme-corp.test/public/%2Fadmin",
+            "https://acme-corp.test/public/%5cadmin",
+            "https://acme-corp.test/public/%5Cadmin",
+            "https://acme-corp.test/public/..\\admin",
+            "https://acme-corp.test/public/%00admin",
+        ]
+        for u in malicious_urls:
+            decision = engine_with_acme.evaluate_url(u)
+            assert not decision.allowed, f"Expected {u} to be blocked"
+            assert decision.decision in (
+                DecisionCode.DENIED_MALFORMED_URL,
+                DecisionCode.DENIED_PATH_OUT_OF_SCOPE,
+            ), f"Unexpected decision code for {u}: {decision.decision}"
+
+    def test_sec_02_empty_allowed_path_prefixes_must_fail_closed(self, engine_with_acme):
+        scope = engine_with_acme.allowlist.get_scope_for_company("comp_acme_test_001")
+        scope.allowed_path_prefixes = []  # Empty allowed prefixes! Must reject everything
+
+        decision = engine_with_acme.evaluate_url("https://acme-corp.test/public/index.html")
+        assert not decision.allowed
+        assert decision.decision == DecisionCode.DENIED_PATH_OUT_OF_SCOPE
+        assert "No allowed path prefixes configured" in decision.reason or "outside allowed" in decision.reason
+
+        # Explicit root "/" should be required to allow the whole site
+        scope.allowed_path_prefixes = ["/"]
+        decision_root = engine_with_acme.evaluate_url("https://acme-corp.test/public/index.html")
+        assert decision_root.allowed
+        assert decision_root.decision == DecisionCode.ALLOWED
+
+    def test_sec_04_prefix_boundary_confusion_blocked(self, engine_with_acme):
+        scope = engine_with_acme.allowlist.get_scope_for_company("comp_acme_test_001")
+        scope.allowed_path_prefixes = ["/public"]
+
+        # /publicity and /public_notes must be blocked despite starting with string "/public"
+        boundary_evasions = [
+            "https://acme-corp.test/publicity",
+            "https://acme-corp.test/publicity/index.html",
+            "https://acme-corp.test/public_notes",
+        ]
+        for u in boundary_evasions:
+            decision = engine_with_acme.evaluate_url(u)
+            assert not decision.allowed, f"Expected boundary evasion {u} to be blocked"
+            assert decision.decision == DecisionCode.DENIED_PATH_OUT_OF_SCOPE
+
+        # Legitimate sub-paths under /public must be allowed
+        legit_urls = [
+            "https://acme-corp.test/public",
+            "https://acme-corp.test/public/",
+            "https://acme-corp.test/public/about",
+        ]
+        for u in legit_urls:
+            decision = engine_with_acme.evaluate_url(u)
+            assert decision.allowed, f"Expected legitimate path {u} to be allowed"
+
+    def test_sec_03_rfc9309_longest_match_and_order_independence(self):
+        allowlist = make_fixture_allowlist()
+        scope = allowlist.get_scope_for_company("comp_acme_test_001")
+        scope.allowed_path_prefixes = ["/"]
+        engine = SourcePolicyEngine(allowlist=allowlist)
+
+        # Test Case 1: Disallow /p vs Allow /page -> /page must be ALLOWED because /page is longer
+        # Even if Disallow comes first
+        robots_order1 = "User-agent: *\nDisallow: /p\nAllow: /page\n"
+        engine.inject_robots_txt("acme-corp.test", robots_order1)
+        decision = engine.evaluate_url("https://acme-corp.test/page")
+        assert decision.allowed, "Longest rule (/page) must win over shorter rule (/p)"
+
+        # Test Case 2: Order reversed
+        robots_order2 = "User-agent: *\nAllow: /page\nDisallow: /p\n"
+        engine.inject_robots_txt("acme-corp.test", robots_order2)
+        decision = engine.evaluate_url("https://acme-corp.test/page")
+        assert decision.allowed, "Rule order must not change longest-match outcome"
+
+    def test_sec_03_rfc9309_equal_length_allow_wins_over_disallow(self):
+        allowlist = make_fixture_allowlist()
+        scope = allowlist.get_scope_for_company("comp_acme_test_001")
+        scope.allowed_path_prefixes = ["/"]
+        engine = SourcePolicyEngine(allowlist=allowlist)
+
+        # When Allow and Disallow have the exact same length, RFC 9309 states Allow wins
+        robots_disallow_first = "User-agent: *\nDisallow: /page\nAllow: /page\n"
+        engine.inject_robots_txt("acme-corp.test", robots_disallow_first)
+        decision = engine.evaluate_url("https://acme-corp.test/page")
+        assert decision.allowed, "Equal length tie: Allow must win over Disallow"
+
+    def test_sec_03_rfc9309_wildcards_and_end_anchors(self):
+        allowlist = make_fixture_allowlist()
+        scope = allowlist.get_scope_for_company("comp_acme_test_001")
+        scope.allowed_path_prefixes = ["/"]
+        engine = SourcePolicyEngine(allowlist=allowlist)
+
+        robots_rules = "User-agent: *\nDisallow: /*.php$\nDisallow: /private*secret$\nAllow: /\n"
+        engine.inject_robots_txt("acme-corp.test", robots_rules)
+
+        # /*.php$ matches /index.php but NOT /index.php?query=1 or /index.phpx
+        d1 = engine.evaluate_url("https://acme-corp.test/index.php")
+        assert not d1.allowed
+        assert d1.decision == DecisionCode.DENIED_ROBOTS_DISALLOWED
+
+        d2 = engine.evaluate_url("https://acme-corp.test/index.php?query=1")
+        assert d2.allowed
+
+        d3 = engine.evaluate_url("https://acme-corp.test/private123secret")
+        assert not d3.allowed
+        assert d3.decision == DecisionCode.DENIED_ROBOTS_DISALLOWED
+
+        d4 = engine.evaluate_url("https://acme-corp.test/private123secret/more")
+        assert d4.allowed
+
+    def test_sec_03_rfc9309_multiple_user_agents_and_case_sensitivity(self):
+        allowlist = make_fixture_allowlist()
+        scope = allowlist.get_scope_for_company("comp_acme_test_001")
+        scope.allowed_path_prefixes = ["/"]
+        # Set user agent to HarveyControlledBot/1.0
+        engine = SourcePolicyEngine(allowlist=allowlist, user_agent="HarveyControlledBot/1.0")
+
+        robots_txt = "User-agent: Googlebot\nDisallow: /\n\nUser-agent: HarveyControlledBot\nDisallow: /private/\nAllow: /public/\nAllow: /CaseSensitive/\n\nUser-agent: *\nDisallow: /public/\n"
+        engine.inject_robots_txt("acme-corp.test", robots_txt)
+
+        # Specific UA group should match HarveyControlledBot instead of Googlebot or *
+        d1 = engine.evaluate_url("https://acme-corp.test/public/data")
+        assert d1.allowed
+
+        # Case sensitivity: /CaseSensitive/ allowed, /casesensitive/ disallowed or falls through
+        d2 = engine.evaluate_url("https://acme-corp.test/CaseSensitive/doc")
+        assert d2.allowed
+    def test_revoked_and_suspended_authorization_denied(self, engine_with_acme):
+        scope = engine_with_acme.allowlist.get_scope_for_company('comp_acme_test_001')
+
+        # Suspended
+        scope.source_status = SourceStatus.SUSPENDED
+        d_susp = engine_with_acme.evaluate_url('https://acme-corp.test/public/valid')
+        assert not d_susp.allowed
+        assert d_susp.decision == DecisionCode.DENIED_SOURCE_STATUS_FAIL_CLOSED
+
+        # Revoked
+        scope.source_status = SourceStatus.REVOKED
+        d_rev = engine_with_acme.evaluate_url('https://acme-corp.test/public/valid')
+        assert not d_rev.allowed
+        assert d_rev.decision == DecisionCode.DENIED_SOURCE_STATUS_FAIL_CLOSED
+
+    def test_redirect_to_out_of_scope_or_traversal_path_blocked(self, engine_with_acme):
+        # Redirect target in scope path
+        r1 = engine_with_acme.evaluate_redirect(
+            'https://acme-corp.test/public/start',
+            'https://acme-corp.test/public/ok'
+        )
+        assert r1.allowed
+
+        # Redirect target out-of-scope path (/other)
+        r2 = engine_with_acme.evaluate_redirect(
+            'https://acme-corp.test/public/start',
+            'https://acme-corp.test/unauthorized/leak'
+        )
+        assert not r2.allowed
+        assert r2.target_decision.decision == DecisionCode.DENIED_PATH_OUT_OF_SCOPE
+
+        # Redirect target with traversal encoding
+        r3 = engine_with_acme.evaluate_redirect(
+            'https://acme-corp.test/public/start',
+            'https://acme-corp.test/public/%2e%2e/admin'
+        )
+        assert not r3.allowed
+        assert r3.target_decision.decision == DecisionCode.DENIED_MALFORMED_URL
+
+    def test_zero_real_network_calls_invariant(self, monkeypatch, engine_with_acme):
+        # Ensure that evaluate_url and evaluate_redirect NEVER perform socket/network calls
+        import socket
+        def blow_up(*args, **kwargs):
+            raise AssertionError('Real network socket call attempted!')
+        monkeypatch.setattr(socket, 'socket', blow_up)
+
+        # Evaluate a URL and redirect
+        d = engine_with_acme.evaluate_url('https://acme-corp.test/public/index.html')
+        assert d.allowed
+        r = engine_with_acme.evaluate_redirect(
+            'https://acme-corp.test/public/index.html',
+            'https://acme-corp.test/public/next'
+        )
+        assert r.allowed
+
