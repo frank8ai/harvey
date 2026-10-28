@@ -71,6 +71,7 @@ async def run_profile_stage(
     state,
     limit: int = 100,
     stale_days: int = PROFILE_STALE_DAYS,
+    gateway=None,
 ) -> tuple[int, int, str]:
     """Profile whatever currently needs it.
 
@@ -86,7 +87,10 @@ async def run_profile_stage(
         return 0, 0, ""
 
     logger.info("profile: %d companies need a look", len(pending))
-    observations, run_id = await profile_companies(state, pending)
+    if gateway is not None:
+        observations, run_id = await profile_companies(state, pending, gateway=gateway)
+    else:
+        observations, run_id = await profile_companies(state, pending)
     return len(pending), observations, run_id
 
 
