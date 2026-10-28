@@ -1,84 +1,134 @@
-"""Controlled Discovery module for Harvey.
-Provides policy engine, allowlist checking, robots.txt gating,
-egress limiter, hard budget ledger, audit logging, receipts,
-and unified fail-closed outbound security gateway.
+"""Public API for Harvey Controlled Discovery.
+
+Provides policy engine, allowlist checking, RFC 9309 robots.txt gating,
+persistent egress limiter, hard budget ledger, outbound audit logging,
+trusted cryptographic receipts, and unified fail-closed outbound security gateway.
+
+Importing this package must not perform network I/O, open databases,
+start workers, acquire leases, or enable outbound delivery.
+
+Readiness and authorization are enforced by runtime policy and physical
+transport controls, not by importing this package.
 """
 
-from harvey.controlled_discovery.policy import (
+from .audit import (
+    OutboundAuditEvent,
+    OutboundAuditLogger,
+    sanitize_headers,
+    sanitize_url,
+)
+from .budget import (
+    BudgetAlreadySettledError,
+    BudgetExceededError,
+    BudgetLimits,
+    BudgetReservationNotFoundError,
+    BudgetUnauthorizedError,
+    HardBudgetLedger,
+    ReservationRecord,
+    ReservationRequest,
+    SettlementReport,
+)
+from .gateway import (
+    ControlledEgressBlockedError,
+    ControlledEgressGateway,
+    ControlledEgressResponse,
+)
+from .limiter import (
+    ConcurrencyTimeoutError,
+    FakeClock,
+    LeaseExpiredError,
+    LeaseReleaseOutcome,
+    LimiterAcquireStatus,
+    LimiterConfig,
+    LimiterError,
+    MaxRetriesExceededError,
+    OfflineEgressBlockedError,
+    PersistentEgressLimiter,
+    RedirectLimitExceededError,
+    RequestLease,
+    ResponseBodyMeter,
+    ResponseSizeLimitExceededError,
+    SystemClock,
+)
+from .policy import (
     AccessPurpose,
     AuthorizationStatus,
     CompanyTargetScope,
     DecisionCode,
     NormalizedUrl,
     PolicyDecision,
+    RFC9309Group,
+    RFC9309RobotsParser,
+    RFC9309Rule,
     RedirectDecision,
     RobotsFetchStatus,
     SourcePolicyEngine,
     SourceStatus,
     TargetAllowlist,
 )
-from harvey.controlled_discovery.limiter import (
-    EgressLimiter,
-    EgressPermit,
-    DomainPacingState,
-    ResponseBodyMeter,
-    MeteredStream,
-)
-from harvey.controlled_discovery.budget_ledger import (
-    HardBudgetLedger,
-    ReservationRequest,
-    SettlementReport,
-    BudgetBalance,
-    ExecutionStatus,
-    BudgetExhaustedError,
-    BudgetAlreadySettledError,
-    PricingSchedule,)
-from harvey.controlled_discovery.audit import (
-    AuditLogger,
-    OutboundAuditEvent,
-)
-from harvey.controlled_discovery.receipt import (
-    TrustedCollectionReceipt,
-    ReceiptSigner,
-    ReceiptVerifier,
-)
-from harvey.controlled_discovery.gateway import (
-    ControlledEgressGateway,
-    EgressResponse,
-    EgressSecurityError,
+from .receipt import (
+    CollectorReceipt,
+    ReceiptKind,
+    ReceiptReplayLedger,
+    ReceiptValidationResult,
+    ReceiptValidationStatus,
+    compute_content_sha256,
+    sign_collector_receipt,
+    verify_collector_receipt,
 )
 
 __all__ = [
     "AccessPurpose",
     "AuthorizationStatus",
+    "BudgetAlreadySettledError",
+    "BudgetExceededError",
+    "BudgetLimits",
+    "BudgetReservationNotFoundError",
+    "BudgetUnauthorizedError",
+    "CollectorReceipt",
     "CompanyTargetScope",
+    "ConcurrencyTimeoutError",
+    "ControlledEgressBlockedError",
+    "ControlledEgressGateway",
+    "ControlledEgressResponse",
     "DecisionCode",
+    "FakeClock",
+    "HardBudgetLedger",
+    "LeaseExpiredError",
+    "LeaseReleaseOutcome",
+    "LimiterAcquireStatus",
+    "LimiterConfig",
+    "LimiterError",
+    "MaxRetriesExceededError",
     "NormalizedUrl",
+    "OfflineEgressBlockedError",
+    "OutboundAuditEvent",
+    "OutboundAuditLogger",
+    "PersistentEgressLimiter",
     "PolicyDecision",
+    "RFC9309Group",
+    "RFC9309RobotsParser",
+    "RFC9309Rule",
+    "ReceiptKind",
+    "ReceiptReplayLedger",
+    "ReceiptValidationResult",
+    "ReceiptValidationStatus",
     "RedirectDecision",
+    "RedirectLimitExceededError",
+    "RequestLease",
+    "ReservationRecord",
+    "ReservationRequest",
+    "ResponseBodyMeter",
+    "ResponseSizeLimitExceededError",
     "RobotsFetchStatus",
+    "SettlementReport",
     "SourcePolicyEngine",
     "SourceStatus",
+    "SystemClock",
     "TargetAllowlist",
-    "EgressLimiter",
-    "EgressPermit",
-    "DomainPacingState",
-    "ResponseBodyMeter",
-    "MeteredStream",
-    "HardBudgetLedger",
-    "ReservationRequest",
-    "SettlementReport",
-    "BudgetBalance",
-    "ExecutionStatus",
-    "BudgetExhaustedError",
-    "BudgetAlreadySettledError",
-    "PricingSchedule",
-    "AuditLogger",
-    "OutboundAuditEvent",
-    "TrustedCollectionReceipt",
-    "ReceiptSigner",
-    "ReceiptVerifier",
-    "ControlledEgressGateway",
-    "EgressResponse",
-    "EgressSecurityError",
+    "compute_content_sha256",
+    "sanitize_headers",
+    "sanitize_url",
+    "sign_collector_receipt",
+    "verify_collector_receipt",
 ]
